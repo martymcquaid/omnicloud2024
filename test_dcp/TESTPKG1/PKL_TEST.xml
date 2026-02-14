@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PackingList>
+  <Id>urn:uuid:22222222-2222-2222-2222-222222222222</Id>
+  <AnnotationText>OmniCloud Test PKL</AnnotationText>
+  <IssueDate>2026-02-13T00:00:00Z</IssueDate>
+  <Issuer>OmniCloud</Issuer>
+  <Creator>OmniCloud Test</Creator>
+  <AssetList>
+    <Asset>
+      <Id>urn:uuid:44444444-4444-4444-4444-444444444444</Id>
+      <Hash>DEADBEEF</Hash>
+      <Size>123</Size>
+      <Type>application/mxf</Type>
+    </Asset>
+    <Asset>
+      <Id>urn:uuid:33333333-3333-3333-3333-333333333333</Id>
+      <Hash>CAFEBABE</Hash>
+      <Size>456</Size>
+      <Type>text/xml</Type>
+    </Asset>
+  </AssetList>
+</PackingList>

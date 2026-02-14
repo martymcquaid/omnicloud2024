@@ -1,0 +1,1045 @@
+package api
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	"github.com/omnicloud/omnicloud/internal/db"
+	"github.com/omnicloud/omnicloud/internal/updater"
+)
+
+// Response structures
+type HealthResponse struct {
+	Status  string    `json:"status"`
+	Time    time.Time `json:"time"`
+	Version string    `json:"version"`
+}
+
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message,omitempty"`
+}
+
+type ServerRegistration struct {
+	Name              string  `json:"name"`
+	Location          string  `json:"location"`
+	APIURL            string  `json:"api_url"`
+	MACAddress        string  `json:"mac_address"`
+	RegistrationKey   string  `json:"registration_key"`
+	StorageCapacityTB float64 `json:"storage_capacity_tb"`
+	SoftwareVersion   string  `json:"software_version,omitempty"`
+}
+
+type InventoryUpdate struct {
+	Packages []InventoryPackage `json:"packages"`
+}
+
+type InventoryPackage struct {
+	AssetMapUUID string `json:"assetmap_uuid"`
+	LocalPath    string `json:"local_path"`
+	Status       string `json:"status"`
+}
+
+// handleHealth returns server health status
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// Test database connection
+	if err := s.database.Ping(); err != nil {
+		respondError(w, http.StatusServiceUnavailable, "Database unavailable", err.Error())
+		return
+	}
+
+	response := HealthResponse{
+		Status:  "healthy",
+		Time:    time.Now(),
+		Version: "1.0.0",
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// handleListServers returns all registered servers
+func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.database.Query("SELECT id, name, location, api_url, COALESCE(mac_address, ''), COALESCE(is_authorized, false), last_seen, storage_capacity_tb FROM servers ORDER BY name")
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query servers", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var servers []map[string]interface{}
+	for rows.Next() {
+		var id uuid.UUID
+		var name, location, apiURL, macAddress string
+		var isAuthorized bool
+		var lastSeen *time.Time
+		var capacity float64
+
+		if err := rows.Scan(&id, &name, &location, &apiURL, &macAddress, &isAuthorized, &lastSeen, &capacity); err != nil {
+			log.Printf("Error scanning server row: %v", err)
+			continue
+		}
+
+		servers = append(servers, map[string]interface{}{
+			"id":                   id,
+			"name":                 name,
+			"location":             location,
+			"api_url":              apiURL,
+			"mac_address":          macAddress,
+			"is_authorized":        isAuthorized,
+			"last_seen":            lastSeen,
+			"storage_capacity_tb":  capacity,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"servers": servers,
+		"count":   len(servers),
+	})
+}
+
+// handleRegisterServer registers a new site server with MAC address authentication
+func (s *Server) handleRegisterServer(w http.ResponseWriter, r *http.Request) {
+	var reg ServerRegistration
+	if err := json.NewDecoder(r.Body).Decode(&reg); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	// Validate required fields
+	if reg.Name == "" || reg.MACAddress == "" || reg.RegistrationKey == "" {
+		respondError(w, http.StatusBadRequest, "Missing required fields", "name, mac_address, and registration_key are required")
+		return
+	}
+
+	// Check if server already exists by MAC address
+	existing, err := s.database.GetServerByMACAddress(reg.MACAddress)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+
+	now := time.Now()
+	
+	if existing != nil {
+		// Server exists - verify registration key matches
+		if !verifyRegistrationKey(reg.RegistrationKey, existing.RegistrationKeyHash) {
+			log.Printf("Unauthorized registration attempt from MAC: %s", reg.MACAddress)
+			respondError(w, http.StatusUnauthorized, "Invalid credentials", "MAC address and registration key do not match")
+			return
+		}
+
+		// Update existing server
+		existing.Name = reg.Name
+		existing.Location = reg.Location
+		existing.APIURL = reg.APIURL
+		existing.LastSeen = &now
+		existing.StorageCapacityTB = reg.StorageCapacityTB
+		existing.IsAuthorized = true
+
+		// Update software version if provided
+		if reg.SoftwareVersion != "" {
+			query := `UPDATE servers SET software_version = $1, last_version_check = $2 WHERE id = $3`
+			s.database.DB.Exec(query, reg.SoftwareVersion, now, existing.ID)
+		}
+
+		if err := s.database.UpsertServer(existing); err != nil {
+			respondError(w, http.StatusInternalServerError, "Failed to update server", err.Error())
+			return
+		}
+
+		log.Printf("Server re-registered: %s (MAC: %s, ID: %s, Version: %s)", existing.Name, reg.MACAddress, existing.ID, reg.SoftwareVersion)
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"id":      existing.ID,
+			"message": "Server re-registered successfully",
+			"status":  "existing",
+		})
+		return
+	}
+
+	// New server - verify registration key matches main server key
+	if reg.RegistrationKey != s.registrationKey {
+		log.Printf("Invalid registration key from new server: %s (MAC: %s)", reg.Name, reg.MACAddress)
+		respondError(w, http.StatusUnauthorized, "Invalid registration key", "The provided registration key is incorrect")
+		return
+	}
+
+	// Create new server with hashed key - NOT AUTHORIZED BY DEFAULT
+	keyHash := hashRegistrationKey(reg.RegistrationKey)
+	server := &db.Server{
+		ID:                  uuid.New(),
+		Name:                reg.Name,
+		Location:            reg.Location,
+		APIURL:              reg.APIURL,
+		MACAddress:          reg.MACAddress,
+		RegistrationKeyHash: keyHash,
+		IsAuthorized:        false, // Must be authorized by admin
+		LastSeen:            &now,
+		StorageCapacityTB:   reg.StorageCapacityTB,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+
+	if err := s.database.UpsertServer(server); err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to register server", err.Error())
+		return
+	}
+
+	log.Printf("New server registered (AWAITING AUTHORIZATION): %s (MAC: %s, ID: %s)", server.Name, reg.MACAddress, server.ID)
+	respondJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":            server.ID,
+		"message":       "Server registered successfully - awaiting administrator authorization",
+		"status":        "pending_authorization",
+		"is_authorized": false,
+	})
+}
+
+// handleHeartbeat updates server last_seen timestamp
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	now := time.Now()
+	_, err = s.database.Exec("UPDATE servers SET last_seen = $1, updated_at = $2 WHERE id = $3",
+		now, now, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to update heartbeat", err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Heartbeat recorded",
+	})
+}
+
+// handleUpdateServer updates server configuration (including authorization status)
+func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var update struct {
+		Name              *string  `json:"name"`
+		Location          *string  `json:"location"`
+		IsAuthorized      *bool    `json:"is_authorized"`
+		StorageCapacityTB *float64 `json:"storage_capacity_tb"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	// Build dynamic update query
+	query := "UPDATE servers SET updated_at = $1"
+	args := []interface{}{time.Now()}
+	argPos := 2
+
+	if update.Name != nil {
+		query += fmt.Sprintf(", name = $%d", argPos)
+		args = append(args, *update.Name)
+		argPos++
+	}
+
+	if update.Location != nil {
+		query += fmt.Sprintf(", location = $%d", argPos)
+		args = append(args, *update.Location)
+		argPos++
+	}
+
+	if update.IsAuthorized != nil {
+		query += fmt.Sprintf(", is_authorized = $%d", argPos)
+		args = append(args, *update.IsAuthorized)
+		argPos++
+		
+		if *update.IsAuthorized {
+			log.Printf("Server %s has been AUTHORIZED", serverID)
+		} else {
+			log.Printf("Server %s has been UNAUTHORIZED", serverID)
+		}
+	}
+
+	if update.StorageCapacityTB != nil {
+		query += fmt.Sprintf(", storage_capacity_tb = $%d", argPos)
+		args = append(args, *update.StorageCapacityTB)
+		argPos++
+	}
+
+	query += fmt.Sprintf(" WHERE id = $%d", argPos)
+	args = append(args, serverID)
+
+	result, err := s.database.DB.Exec(query, args...)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to update server", err.Error())
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		respondError(w, http.StatusNotFound, "Server not found", "No server with that ID")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Server updated successfully",
+	})
+}
+
+// handleDeleteServer removes a server from the system
+func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	// First, remove all inventory entries for this server
+	_, err = s.database.DB.Exec("DELETE FROM server_dcp_inventory WHERE server_id = $1", serverID)
+	if err != nil {
+		log.Printf("Warning: failed to delete inventory for server %s: %v", serverID, err)
+	}
+
+	// Delete the server
+	result, err := s.database.DB.Exec("DELETE FROM servers WHERE id = $1", serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to delete server", err.Error())
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		respondError(w, http.StatusNotFound, "Server not found", "No server with that ID")
+		return
+	}
+
+	log.Printf("Server %s has been DELETED", serverID)
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Server deleted successfully",
+	})
+}
+
+// handleUpdateInventory updates a server's DCP inventory
+func (s *Server) handleUpdateInventory(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var update InventoryUpdate
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	// Process each package in the inventory
+	updated := 0
+	for _, pkg := range update.Packages {
+		assetMapUUID, err := uuid.Parse(pkg.AssetMapUUID)
+		if err != nil {
+			log.Printf("Invalid UUID %s: %v", pkg.AssetMapUUID, err)
+			continue
+		}
+
+		// Get package ID
+		dcpPkg, err := s.database.GetDCPPackageByAssetMapUUID(assetMapUUID)
+		if err != nil || dcpPkg == nil {
+			log.Printf("Package not found: %s", assetMapUUID)
+			continue
+		}
+
+		// Upsert inventory record
+		now := time.Now()
+		inv := &db.ServerDCPInventory{
+			ID:           uuid.New(),
+			ServerID:     serverID,
+			PackageID:    dcpPkg.ID,
+			LocalPath:    pkg.LocalPath,
+			Status:       pkg.Status,
+			LastVerified: now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+
+		if err := s.database.UpsertServerDCPInventory(inv); err != nil {
+			log.Printf("Error updating inventory: %v", err)
+			continue
+		}
+		updated++
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Inventory updated",
+		"updated": updated,
+		"total":   len(update.Packages),
+	})
+}
+
+// handleGetServerDCPs returns all DCPs on a specific server
+func (s *Server) handleGetServerDCPs(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	query := `
+		SELECT p.id, p.assetmap_uuid, p.package_name, p.content_title, p.content_kind,
+		       i.local_path, i.status, i.last_verified
+		FROM dcp_packages p
+		JOIN server_dcp_inventory i ON p.id = i.package_id
+		WHERE i.server_id = $1
+		ORDER BY p.package_name`
+
+	rows, err := s.database.Query(query, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query DCPs", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var dcps []map[string]interface{}
+	for rows.Next() {
+		var id, assetMapUUID uuid.UUID
+		var packageName, contentTitle, contentKind, localPath, status string
+		var lastVerified time.Time
+
+		if err := rows.Scan(&id, &assetMapUUID, &packageName, &contentTitle, &contentKind,
+			&localPath, &status, &lastVerified); err != nil {
+			log.Printf("Error scanning DCP row: %v", err)
+			continue
+		}
+
+		dcps = append(dcps, map[string]interface{}{
+			"id":              id,
+			"assetmap_uuid":   assetMapUUID,
+			"package_name":    packageName,
+			"content_title":   contentTitle,
+			"content_kind":    contentKind,
+			"local_path":      localPath,
+			"status":          status,
+			"last_verified":   lastVerified,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"dcps":  dcps,
+		"count": len(dcps),
+	})
+}
+
+// handleListDCPs returns all DCP packages that are available on at least one server
+func (s *Server) handleListDCPs(w http.ResponseWriter, r *http.Request) {
+	query := `
+		SELECT DISTINCT dp.id, dp.assetmap_uuid, dp.package_name, dp.content_title, dp.content_kind,
+		       dp.issuer, dp.total_size_bytes, dp.file_count, dp.discovered_at
+		FROM dcp_packages dp
+		INNER JOIN server_dcp_inventory sdi ON dp.id = sdi.package_id
+		WHERE sdi.status = 'online'
+		ORDER BY dp.discovered_at DESC
+		LIMIT 100`
+
+	rows, err := s.database.Query(query)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query DCPs", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var dcps []map[string]interface{}
+	for rows.Next() {
+		var id, assetMapUUID uuid.UUID
+		var packageName, contentTitle, contentKind, issuer string
+		var totalSize int64
+		var fileCount int
+		var discoveredAt time.Time
+
+		if err := rows.Scan(&id, &assetMapUUID, &packageName, &contentTitle, &contentKind,
+			&issuer, &totalSize, &fileCount, &discoveredAt); err != nil {
+			log.Printf("Error scanning DCP row: %v", err)
+			continue
+		}
+
+		dcps = append(dcps, map[string]interface{}{
+			"id":               id,
+			"assetmap_uuid":    assetMapUUID,
+			"package_name":     packageName,
+			"content_title":    contentTitle,
+			"content_kind":     contentKind,
+			"issuer":           issuer,
+			"total_size_bytes": totalSize,
+			"file_count":       fileCount,
+			"discovered_at":    discoveredAt,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"dcps":  dcps,
+		"count": len(dcps),
+	})
+}
+
+// handleGetDCP returns detailed information about a specific DCP
+func (s *Server) handleGetDCP(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	dcpUUID, err := uuid.Parse(vars["uuid"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid DCP UUID", err.Error())
+		return
+	}
+
+	pkg, err := s.database.GetDCPPackageByAssetMapUUID(dcpUUID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query DCP", err.Error())
+		return
+	}
+	if pkg == nil {
+		respondError(w, http.StatusNotFound, "DCP not found", "")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":               pkg.ID,
+		"assetmap_uuid":    pkg.AssetMapUUID,
+		"package_name":     pkg.PackageName,
+		"content_title":    pkg.ContentTitle,
+		"content_kind":     pkg.ContentKind,
+		"issue_date":       pkg.IssueDate,
+		"issuer":           pkg.Issuer,
+		"creator":          pkg.Creator,
+		"volume_count":     pkg.VolumeCount,
+		"total_size_bytes": pkg.TotalSizeBytes,
+		"file_count":       pkg.FileCount,
+		"discovered_at":    pkg.DiscoveredAt,
+		"last_verified":    pkg.LastVerified,
+	})
+}
+
+// handleRegisterVersion adds a new version to the catalog (used by build-release.sh)
+func (s *Server) handleRegisterVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+		return
+	}
+	var body struct {
+		Version      string `json:"version"`
+		BuildTime    string `json:"build_time"`
+		Checksum     string `json:"checksum"`
+		SizeBytes    int64  `json:"size_bytes"`
+		DownloadURL  string `json:"download_url"`
+		IsStable     *bool  `json:"is_stable"`
+		ReleaseNotes string `json:"release_notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid JSON", err.Error())
+		return
+	}
+	if body.Version == "" || body.Checksum == "" || body.DownloadURL == "" {
+		respondError(w, http.StatusBadRequest, "Missing required fields", "version, checksum, download_url required")
+		return
+	}
+	isStable := true
+	if body.IsStable != nil {
+		isStable = *body.IsStable
+	}
+	_, err := s.database.DB.Exec(`
+		INSERT INTO software_versions (version, build_time, checksum, size_bytes, download_url, is_stable, release_notes)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
+		ON CONFLICT (version) DO UPDATE SET
+			build_time = EXCLUDED.build_time,
+			checksum = EXCLUDED.checksum,
+			size_bytes = EXCLUDED.size_bytes,
+			download_url = EXCLUDED.download_url,
+			is_stable = EXCLUDED.is_stable,
+			release_notes = EXCLUDED.release_notes`,
+		body.Version, body.BuildTime, body.Checksum, body.SizeBytes, body.DownloadURL, isStable, body.ReleaseNotes)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to register version", err.Error())
+		return
+	}
+	log.Printf("Registered version %s in catalog", body.Version)
+	respondJSON(w, http.StatusCreated, map[string]interface{}{
+		"message": "Version registered",
+		"version": body.Version,
+	})
+}
+
+// handleListVersions returns all available software versions
+func (s *Server) handleListVersions(w http.ResponseWriter, r *http.Request) {
+	query := `
+		SELECT version, build_time, checksum, size_bytes, download_url, is_stable, release_notes, created_at
+		FROM software_versions
+		ORDER BY created_at DESC`
+
+	rows, err := s.database.Query(query)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query versions", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var versions []map[string]interface{}
+	for rows.Next() {
+		var version, checksum, downloadURL string
+		var releaseNotes sql.NullString
+		var sizeBytes int64
+		var isStable bool
+		var buildTime, createdAt time.Time
+
+		if err := rows.Scan(&version, &buildTime, &checksum, &sizeBytes, &downloadURL, &isStable, &releaseNotes, &createdAt); err != nil {
+			log.Printf("Error scanning version row: %v", err)
+			continue
+		}
+
+		versionData := map[string]interface{}{
+			"version":      version,
+			"build_time":   buildTime,
+			"checksum":     checksum,
+			"size_bytes":   sizeBytes,
+			"download_url": downloadURL,
+			"is_stable":    isStable,
+			"created_at":   createdAt,
+		}
+
+		if releaseNotes.Valid {
+			versionData["release_notes"] = releaseNotes.String
+		}
+
+		versions = append(versions, versionData)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"versions": versions,
+		"count":    len(versions),
+	})
+}
+
+// handleGetLatestVersion returns the latest stable version
+func (s *Server) handleGetLatestVersion(w http.ResponseWriter, r *http.Request) {
+	query := `
+		SELECT version, build_time, checksum, size_bytes, download_url, release_notes, created_at
+		FROM software_versions
+		WHERE is_stable = true
+		ORDER BY created_at DESC
+		LIMIT 1`
+
+	var version, checksum, downloadURL string
+	var releaseNotes sql.NullString
+	var sizeBytes int64
+	var buildTime, createdAt time.Time
+
+	err := s.database.QueryRow(query).Scan(&version, &buildTime, &checksum, &sizeBytes, &downloadURL, &releaseNotes, &createdAt)
+	if err == sql.ErrNoRows {
+		respondError(w, http.StatusNotFound, "No stable version found", "")
+		return
+	}
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query latest version", err.Error())
+		return
+	}
+
+	versionData := map[string]interface{}{
+		"version":      version,
+		"build_time":   buildTime,
+		"checksum":     checksum,
+		"size_bytes":   sizeBytes,
+		"download_url": downloadURL,
+		"is_stable":    true,
+		"created_at":   createdAt,
+	}
+
+	if releaseNotes.Valid {
+		versionData["release_notes"] = releaseNotes.String
+	}
+
+	respondJSON(w, http.StatusOK, versionData)
+}
+
+// handleTriggerUpgrade sets a target version for a server to upgrade to
+func (s *Server) handleTriggerUpgrade(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var request struct {
+		TargetVersion string `json:"target_version"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	if request.TargetVersion == "" {
+		respondError(w, http.StatusBadRequest, "Missing target_version", "")
+		return
+	}
+
+	// Verify version exists
+	var exists bool
+	err = s.database.QueryRow("SELECT EXISTS(SELECT 1 FROM software_versions WHERE version = $1)", request.TargetVersion).Scan(&exists)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+	if !exists {
+		respondError(w, http.StatusNotFound, "Version not found", "")
+		return
+	}
+
+	// Set target version and upgrade status
+	_, err = s.database.DB.Exec(`
+		UPDATE servers 
+		SET target_version = $1, upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
+		WHERE id = $2`,
+		request.TargetVersion, serverID)
+
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to set upgrade target", err.Error())
+		return
+	}
+
+	log.Printf("Upgrade triggered for server %s to version %s", serverID, request.TargetVersion)
+
+	// If this process is the target (main server upgrading itself), run upgrade locally then restart
+	if s.selfServerID != nil && *s.selfServerID == serverID {
+		go func() {
+			baseURL := "http://127.0.0.1:" + strconv.Itoa(s.port)
+			if err := updater.PerformSelfUpgrade(baseURL, request.TargetVersion); err != nil {
+				log.Printf("Self-upgrade failed: %v", err)
+				s.database.DB.Exec(`UPDATE servers SET upgrade_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, "failed", serverID)
+				return
+			}
+			s.database.DB.Exec(`UPDATE servers SET upgrade_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, "success", serverID)
+			log.Printf("Self-upgrade complete; restarting in 2s")
+			time.Sleep(2 * time.Second)
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":        "Upgrade triggered successfully",
+		"server_id":      serverID,
+		"target_version": request.TargetVersion,
+		"status":         "pending",
+	})
+}
+
+// handleRestartServer triggers a restart for a specific server
+func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	// Set a restart flag by setting target_version to "restart"
+	// The update agent (on remote clients) will detect this and restart their service
+	_, err = s.database.DB.Exec(`
+		UPDATE servers 
+		SET target_version = 'restart', upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1`,
+		serverID)
+
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to trigger restart", err.Error())
+		return
+	}
+
+	log.Printf("Restart triggered for server %s", serverID)
+
+	// If this process is the target (main server restarting itself), restart locally after a short delay
+	if s.selfServerID != nil && *s.selfServerID == serverID {
+		log.Printf("Restart target is this server; scheduling local restart in 2s")
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("Sending SIGTERM for self-restart (systemd will restart the service)")
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":   "Restart triggered successfully",
+		"server_id": serverID,
+		"status":    "pending",
+	})
+}
+
+// handlePendingAction returns the pending restart/upgrade action for the calling server (used by update agent)
+func (s *Server) handlePendingAction(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var targetVersion sql.NullString
+	var upgradeStatus sql.NullString
+	err = s.database.QueryRow(`
+		SELECT target_version, upgrade_status FROM servers WHERE id = $1`,
+		serverID).Scan(&targetVersion, &upgradeStatus)
+	if err == sql.ErrNoRows {
+		respondError(w, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+
+	status := upgradeStatus.String
+	if status != "pending" {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"action": nil})
+		return
+	}
+
+	target := targetVersion.String
+	if target == "restart" {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"action": "restart"})
+		return
+	}
+	if target != "" {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"action":         "upgrade",
+			"target_version": target,
+		})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"action": nil})
+}
+
+// handleActionDone clears the pending action after the agent has completed restart or upgrade
+func (s *Server) handleActionDone(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var request struct {
+		Action string `json:"action"` // "restart" or "upgrade"
+		Status string `json:"status"` // "success" or "failed"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if request.Action != "restart" && request.Action != "upgrade" {
+		respondError(w, http.StatusBadRequest, "action must be restart or upgrade", "")
+		return
+	}
+	if request.Status == "" {
+		request.Status = "success"
+	}
+
+	_, err = s.database.DB.Exec(`
+		UPDATE servers SET target_version = NULL, upgrade_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+		request.Status, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to clear action", err.Error())
+		return
+	}
+
+	log.Printf("Action %s completed for server %s (status: %s)", request.Action, serverID, request.Status)
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Action acknowledged",
+	})
+}
+
+// handleScanTrigger starts a full library scan on this server (called by Rescan UI or by main server proxying to this site)
+func (s *Server) handleScanTrigger(w http.ResponseWriter, r *http.Request) {
+	if s.triggerScan == nil {
+		respondError(w, http.StatusNotImplemented, "Scan trigger not configured", "")
+		return
+	}
+	go s.triggerScan()
+	respondJSON(w, http.StatusAccepted, map[string]string{"message": "Scan started"})
+}
+
+// handleScanStatus returns the latest scan status for this server (used by main server when polling a site)
+func (s *Server) handleScanStatus(w http.ResponseWriter, r *http.Request) {
+	if s.selfServerID == nil {
+		respondError(w, http.StatusInternalServerError, "Server ID not set", "")
+		return
+	}
+	logEntry, err := s.database.GetLatestScanLog(*s.selfServerID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondJSON(w, http.StatusOK, map[string]interface{}{
+				"status": "idle", "message": "No scan has run yet",
+			})
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "Failed to get scan status", err.Error())
+		return
+	}
+	var completedAt interface{}
+	if logEntry.CompletedAt != nil {
+		completedAt = logEntry.CompletedAt
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                logEntry.ID,
+		"server_id":         logEntry.ServerID,
+		"scan_type":         logEntry.ScanType,
+		"status":            logEntry.Status,
+		"started_at":        logEntry.StartedAt,
+		"completed_at":     completedAt,
+		"packages_found":    logEntry.PackagesFound,
+		"packages_added":    logEntry.PackagesAdded,
+		"packages_updated":  logEntry.PackagesUpdated,
+		"packages_removed": logEntry.PackagesRemoved,
+		"errors":           logEntry.Errors,
+	})
+}
+
+// handleRescanServer triggers a full library rescan on a server (this server or a remote site)
+func (s *Server) handleRescanServer(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+	// If targeting this server, trigger locally
+	if s.selfServerID != nil && serverID == *s.selfServerID {
+		if s.triggerScan == nil {
+			respondError(w, http.StatusNotImplemented, "Scan trigger not configured", "")
+			return
+		}
+		go s.triggerScan()
+		respondJSON(w, http.StatusAccepted, map[string]string{"message": "Rescan started"})
+		return
+	}
+	// Otherwise call the remote server's API
+	server, err := s.database.GetServer(serverID)
+	if err != nil || server == nil {
+		respondError(w, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	if server.APIURL == "" {
+		respondError(w, http.StatusBadRequest, "Server has no API URL", "")
+		return
+	}
+	url := strings.TrimSuffix(server.APIURL, "/") + "/api/v1/scan/trigger"
+	req, err := http.NewRequestWithContext(r.Context(), "POST", url, nil)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to create request", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "Failed to reach server", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		respondError(w, resp.StatusCode, "Server returned error", string(body))
+		return
+	}
+	respondJSON(w, http.StatusAccepted, map[string]string{"message": "Rescan started on remote server"})
+}
+
+// handleServerScanStatus returns the current scan status for a server (this server or remote)
+func (s *Server) handleServerScanStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+	if s.selfServerID != nil && serverID == *s.selfServerID {
+		s.handleScanStatus(w, r)
+		return
+	}
+	server, err := s.database.GetServer(serverID)
+	if err != nil || server == nil {
+		respondError(w, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	if server.APIURL == "" {
+		respondError(w, http.StatusBadRequest, "Server has no API URL", "")
+		return
+	}
+	url := strings.TrimSuffix(server.APIURL, "/") + "/api/v1/scan/status"
+	req, err := http.NewRequestWithContext(r.Context(), "GET", url, nil)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to create request", err.Error())
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "Failed to reach server", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to read response", err.Error())
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		respondError(w, resp.StatusCode, "Server returned error", string(body))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
+// Helper functions
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func respondError(w http.ResponseWriter, status int, error string, message string) {
+	respondJSON(w, status, ErrorResponse{
+		Error:   error,
+		Message: message,
+	})
+}
+
+// hashRegistrationKey creates a SHA256 hash of the registration key
+func hashRegistrationKey(key string) string {
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
+}
+
+// verifyRegistrationKey checks if a key matches the stored hash
+func verifyRegistrationKey(key, hash string) bool {
+	return hashRegistrationKey(key) == hash
+}
