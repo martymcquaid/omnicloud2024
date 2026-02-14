@@ -1,6 +1,6 @@
 -- Add software version tracking
 CREATE TABLE IF NOT EXISTS software_versions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     version VARCHAR(50) NOT NULL UNIQUE,
     build_time TIMESTAMP NOT NULL,
     checksum VARCHAR(64) NOT NULL,

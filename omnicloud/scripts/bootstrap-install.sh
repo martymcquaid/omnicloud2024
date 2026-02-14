@@ -71,8 +71,13 @@ fi
 # Extract
 echo "[3/4] Extracting..."
 tar -xzf "$TARBALL" -C "$WORK_DIR"
-# Tarball contains single top-level dir: omnicloud-{version}-linux-amd64
+# Tarball usually has single top-level dir: omnicloud-{version}-linux-amd64
 EXTRACTED=$(find "$WORK_DIR" -maxdepth 1 -type d -name 'omnicloud-*' | head -1)
+if [ -z "$EXTRACTED" ] || [ ! -f "$EXTRACTED/install.sh" ]; then
+    # Fallback: find any dir under WORK_DIR that contains install.sh
+    EXTRACTED=$(find "$WORK_DIR" -type f -name 'install.sh' | head -1)
+    EXTRACTED="${EXTRACTED%/install.sh}"
+fi
 if [ -z "$EXTRACTED" ] || [ ! -f "$EXTRACTED/install.sh" ]; then
     echo "Error: Extracted package missing install.sh."
     exit 1
