@@ -176,7 +176,7 @@ func main() {
 
 	// Start status reporter (client mode only)
 	if cfg.IsClient() && cfg.MainServerURL != "" {
-		reporter := torrentpkg.NewStatusReporter(torrentClient, cfg.MainServerURL, serverID.String())
+		reporter := torrentpkg.NewStatusReporter(torrentClient, database.DB, cfg.MainServerURL, serverID.String())
 		go reporter.Start(ctx)
 		log.Println("Torrent status reporter started")
 	}
@@ -219,7 +219,7 @@ func main() {
 	// Start client sync if in client mode
 	var clientSync *api.ClientSync
 	if cfg.IsClient() && cfg.MainServerURL != "" {
-		clientSync, err = api.NewClientSync(database, serverID, cfg.MainServerURL, cfg.ServerName, cfg.ServerLocation, cfg.RegistrationKey, Version)
+		clientSync, err = api.NewClientSync(database, serverID, cfg.MainServerURL, cfg.ServerName, cfg.ServerLocation, cfg.RegistrationKey, Version, cfg.ScanPath)
 		if err != nil {
 			log.Printf("Warning: failed to create client sync: %v", err)
 		} else {
@@ -233,6 +233,48 @@ func main() {
 		go updateAgent.Start()
 		defer updateAgent.Stop()
 		log.Println("Update agent started")
+	} else if cfg.IsMainServer() {
+		// Main servers also need periodic storage updates
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			
+			for {
+				select {
+				case <-ticker.C:
+					// Calculate current storage capacity
+					var storageCapacityTB float64
+					if cfg.ScanPath != "" {
+						totalSize, err := dcp.CalculateDirectorySize(cfg.ScanPath)
+						if err != nil {
+							log.Printf("Warning: Could not calculate storage size: %v", err)
+						} else {
+							storageCapacityTB = float64(totalSize) / (1024 * 1024 * 1024 * 1024)
+						}
+					}
+
+					// Get current package count
+					packageCount, _ := database.CountDCPPackages()
+
+					// Update server record
+					_, err := database.DB.Exec(`
+						UPDATE servers 
+						SET storage_capacity_tb = $1, 
+						    software_version = $2,
+						    last_seen = $3
+						WHERE id = $4
+					`, storageCapacityTB, Version, time.Now(), serverID)
+					if err != nil {
+						log.Printf("Error updating server storage: %v", err)
+					} else {
+						log.Printf("Storage updated: %.2f TB, %d packages", storageCapacityTB, packageCount)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		log.Println("Storage updater started")
 	}
 
 	log.Println("OmniCloud is running")
@@ -316,12 +358,33 @@ func registerServer(database *db.DB, cfg *config.Config) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 
+	// Calculate storage capacity from scan path
+	var storageCapacityTB float64
+	if cfg.ScanPath != "" {
+		totalSize, err := dcp.CalculateDirectorySize(cfg.ScanPath)
+		if err != nil {
+			log.Printf("Warning: Could not calculate storage size: %v", err)
+		} else {
+			storageCapacityTB = float64(totalSize) / (1024 * 1024 * 1024 * 1024)
+			log.Printf("Calculated storage: %.2f TB from %s", storageCapacityTB, cfg.ScanPath)
+		}
+	}
+
+	// Detect public IP for API URL
+	publicIP := dcp.GetPublicIP()
+	apiURL := fmt.Sprintf("http://%s:%d", cfg.ServerName, cfg.APIPort)
+	if publicIP != "" && publicIP != "127.0.0.1" {
+		apiURL = fmt.Sprintf("http://%s:%d", publicIP, cfg.APIPort)
+		log.Printf("Detected public IP: %s", publicIP)
+	}
+
 	if existing != nil {
-		// Update existing server (refresh last_seen and api_url so UI shows Online)
+		// Update existing server (refresh last_seen, storage, and api_url)
 		now := time.Now()
 		existing.Location = cfg.ServerLocation
 		existing.LastSeen = &now
-		existing.APIURL = fmt.Sprintf("http://%s:%d", cfg.ServerName, cfg.APIPort)
+		existing.APIURL = apiURL
+		existing.StorageCapacityTB = storageCapacityTB
 		if err := database.UpsertServer(existing); err != nil {
 			return uuid.Nil, err
 		}
@@ -338,7 +401,6 @@ func registerServer(database *db.DB, cfg *config.Config) (uuid.UUID, error) {
 
 	// Create new server
 	now := time.Now()
-	apiURL := fmt.Sprintf("http://%s:%d", cfg.ServerName, cfg.APIPort)
 	server := &db.Server{
 		ID:                  uuid.New(),
 		Name:                cfg.ServerName,
@@ -348,7 +410,7 @@ func registerServer(database *db.DB, cfg *config.Config) (uuid.UUID, error) {
 		RegistrationKeyHash: "",
 		IsAuthorized:        true, // Main server is always authorized
 		LastSeen:            &now,
-		StorageCapacityTB:   0,
+		StorageCapacityTB:   storageCapacityTB,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
@@ -357,7 +419,7 @@ func registerServer(database *db.DB, cfg *config.Config) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 
-	log.Printf("Registered new server: %s (MAC: %s)", server.Name, macAddress)
+	log.Printf("Registered new server: %s (MAC: %s, Storage: %.2f TB)", server.Name, macAddress, storageCapacityTB)
 	return server.ID, nil
 }
 

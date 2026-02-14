@@ -53,6 +53,41 @@ type InventoryPackage struct {
 	Status       string `json:"status"`
 }
 
+// TorrentStatusReport represents the status report sent from clients
+type TorrentStatusReport struct {
+	ServerID   string                 `json:"server_id"`
+	Timestamp  time.Time              `json:"timestamp"`
+	Torrents   []TorrentStatusItem    `json:"torrents"`
+	QueueItems []QueueStatusItem      `json:"queue_items,omitempty"`
+	QueueStats map[string]int         `json:"queue_stats,omitempty"`
+}
+
+// TorrentStatusItem represents status for a single torrent
+type TorrentStatusItem struct {
+	InfoHash       string  `json:"info_hash"`
+	Status         string  `json:"status"`
+	BytesCompleted int64   `json:"bytes_completed"`
+	BytesTotal     int64   `json:"bytes_total"`
+	Progress       float64 `json:"progress"`
+	DownloadSpeed  int64   `json:"download_speed_bps"`
+	UploadSpeed    int64   `json:"upload_speed_bps"`
+	UploadedBytes  int64   `json:"uploaded_bytes"`
+	PeersConnected int     `json:"peers_connected"`
+	ETA            int     `json:"eta_seconds"`
+}
+
+// QueueStatusItem represents status for a single queue item
+type QueueStatusItem struct {
+	ID              string    `json:"id"`
+	PackageID       string    `json:"package_id"`
+	Status          string    `json:"status"`
+	ProgressPercent float64   `json:"progress_percent"`
+	CurrentFile     string    `json:"current_file,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	TotalSizeBytes  int64     `json:"total_size_bytes,omitempty"`
+	HashingSpeedBps int64     `json:"hashing_speed_bps,omitempty"`
+}
+
 // handleHealth returns server health status
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Test database connection
@@ -72,7 +107,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleListServers returns all registered servers
 func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.database.Query("SELECT id, name, location, api_url, COALESCE(mac_address, ''), COALESCE(is_authorized, false), last_seen, storage_capacity_tb FROM servers ORDER BY name")
+	rows, err := s.database.Query("SELECT id, name, location, api_url, COALESCE(mac_address, ''), COALESCE(is_authorized, false), last_seen, storage_capacity_tb, COALESCE(software_version, ''), COALESCE(upgrade_status, 'idle'), target_version FROM servers ORDER BY name")
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to query servers", err.Error())
 		return
@@ -86,22 +121,35 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 		var isAuthorized bool
 		var lastSeen *time.Time
 		var capacity float64
+		var softwareVersion, upgradeStatus string
+		var targetVersion *string
 
-		if err := rows.Scan(&id, &name, &location, &apiURL, &macAddress, &isAuthorized, &lastSeen, &capacity); err != nil {
+		if err := rows.Scan(&id, &name, &location, &apiURL, &macAddress, &isAuthorized, &lastSeen, &capacity, &softwareVersion, &upgradeStatus, &targetVersion); err != nil {
 			log.Printf("Error scanning server row: %v", err)
 			continue
 		}
 
-		servers = append(servers, map[string]interface{}{
+		server := map[string]interface{}{
 			"id":                   id,
 			"name":                 name,
 			"location":             location,
 			"api_url":              apiURL,
 			"mac_address":          macAddress,
 			"is_authorized":        isAuthorized,
-			"last_seen":            lastSeen,
 			"storage_capacity_tb":  capacity,
-		})
+			"software_version":     softwareVersion,
+			"upgrade_status":       upgradeStatus,
+		}
+
+		if lastSeen != nil {
+			server["last_seen"] = lastSeen
+		}
+		
+		if targetVersion != nil {
+			server["target_version"] = *targetVersion
+		}
+
+		servers = append(servers, server)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -215,9 +263,35 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse optional body with storage/version updates
+	var heartbeat struct {
+		StorageCapacityTB float64 `json:"storage_capacity_tb"`
+		SoftwareVersion   string  `json:"software_version"`
+		PackageCount      int     `json:"package_count"`
+	}
+	
+	// Body is optional, just update last_seen if not provided
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&heartbeat)
+	}
+
 	now := time.Now()
-	_, err = s.database.Exec("UPDATE servers SET last_seen = $1, updated_at = $2 WHERE id = $3",
-		now, now, serverID)
+	
+	// Update with storage capacity and software version if provided
+	if heartbeat.StorageCapacityTB > 0 || heartbeat.SoftwareVersion != "" {
+		_, err = s.database.Exec(`
+			UPDATE servers 
+			SET last_seen = $1, 
+			    updated_at = $2,
+			    storage_capacity_tb = COALESCE(NULLIF($3, 0), storage_capacity_tb),
+			    software_version = COALESCE(NULLIF($4, ''), software_version)
+			WHERE id = $5
+		`, now, now, heartbeat.StorageCapacityTB, heartbeat.SoftwareVersion, serverID)
+	} else {
+		_, err = s.database.Exec("UPDATE servers SET last_seen = $1, updated_at = $2 WHERE id = $3",
+			now, now, serverID)
+	}
+	
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to update heartbeat", err.Error())
 		return
@@ -393,6 +467,285 @@ func (s *Server) handleUpdateInventory(w http.ResponseWriter, r *http.Request) {
 		"message": "Inventory updated",
 		"updated": updated,
 		"total":   len(update.Packages),
+	})
+}
+
+// handleTorrentStatus receives and stores torrent status from client servers
+func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var report TorrentStatusReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	now := time.Now()
+
+	// Process queue items (hashing progress)
+	if len(report.QueueItems) > 0 {
+		for _, item := range report.QueueItems {
+			queueID, err := uuid.Parse(item.ID)
+			if err != nil {
+				log.Printf("Invalid queue ID %s: %v", item.ID, err)
+				continue
+			}
+
+			packageID, err := uuid.Parse(item.PackageID)
+			if err != nil {
+				log.Printf("Invalid package ID %s: %v", item.PackageID, err)
+				continue
+			}
+
+			// Upsert torrent_queue with progress from client
+			query := `
+				INSERT INTO torrent_queue (id, package_id, server_id, status, progress_percent, current_file, started_at, total_size_bytes, hashing_speed_bps, synced_at, queued_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT queued_at FROM torrent_queue WHERE id = $1), $10))
+				ON CONFLICT (package_id, server_id)
+				DO UPDATE SET
+					id = $1,
+					status = $4,
+					progress_percent = $5,
+					current_file = $6,
+					started_at = $7,
+					total_size_bytes = $8,
+					hashing_speed_bps = $9,
+					synced_at = $10
+			`
+			_, err = s.db.Exec(query,
+				queueID,
+				packageID,
+				serverID,
+				item.Status,
+				item.ProgressPercent,
+				item.CurrentFile,
+				item.StartedAt,
+				item.TotalSizeBytes,
+				item.HashingSpeedBps,
+				now,
+			)
+			if err != nil {
+				log.Printf("Error updating queue item: %v", err)
+				continue
+			}
+		}
+	}
+
+	// Process torrent status (seeding/downloading)
+	if len(report.Torrents) > 0 {
+		for _, torrent := range report.Torrents {
+			// Update torrent_seeders if this is seeding
+			if torrent.Status == "seeding" || torrent.Status == "completed" {
+				// Get torrent_id from info_hash
+				var torrentID uuid.UUID
+				err := s.db.QueryRow("SELECT id FROM dcp_torrents WHERE info_hash = $1", torrent.InfoHash).Scan(&torrentID)
+				if err != nil {
+					log.Printf("Torrent not found for info_hash %s: %v", torrent.InfoHash, err)
+					continue
+				}
+
+				// Upsert seeder status
+				seederQuery := `
+					INSERT INTO torrent_seeders (id, torrent_id, server_id, local_path, status, uploaded_bytes, last_announce, created_at, updated_at)
+					VALUES (gen_random_uuid(), $1, $2, '', $3, $4, $5, $5, $5)
+					ON CONFLICT (torrent_id, server_id)
+					DO UPDATE SET
+						status = $3,
+						uploaded_bytes = $4,
+						last_announce = $5,
+						updated_at = $5
+				`
+				_, err = s.db.Exec(seederQuery, torrentID, serverID, torrent.Status, torrent.UploadedBytes, now)
+				if err != nil {
+					log.Printf("Error updating seeder: %v", err)
+				}
+			}
+
+			// Update transfers if this is downloading
+			if torrent.Status == "downloading" {
+				transferQuery := `
+					UPDATE transfers SET
+						progress_percent = $1,
+						downloaded_bytes = $2,
+						download_speed_bps = $3,
+						upload_speed_bps = $4,
+						peers_connected = $5,
+						eta_seconds = $6,
+						updated_at = $7
+					WHERE destination_server_id = $8
+					AND status IN ('downloading', 'active')
+					AND EXISTS (SELECT 1 FROM dcp_torrents WHERE info_hash = $9 AND id = transfers.torrent_id)
+				`
+				_, err := s.db.Exec(transferQuery,
+					torrent.Progress,
+					torrent.BytesCompleted,
+					torrent.DownloadSpeed,
+					torrent.UploadSpeed,
+					torrent.PeersConnected,
+					torrent.ETA,
+					now,
+					serverID,
+					torrent.InfoHash,
+				)
+				if err != nil {
+					log.Printf("Error updating transfer: %v", err)
+				}
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":      "Status received",
+		"queue_items":  len(report.QueueItems),
+		"torrent_items": len(report.Torrents),
+	})
+}
+
+// handleDCPMetadata receives and stores complete DCP metadata from client servers
+func (s *Server) handleDCPMetadata(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var update DCPMetadataUpdate
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	packagesProcessed := 0
+	compositionsProcessed := 0
+	assetsProcessed := 0
+
+	// Process each package
+	for _, pkg := range update.Packages {
+		pkgID, err := uuid.Parse(pkg.ID)
+		if err != nil {
+			log.Printf("Invalid package ID %s: %v", pkg.ID, err)
+			continue
+		}
+
+		assetMapUUID, err := uuid.Parse(pkg.AssetMapUUID)
+		if err != nil {
+			log.Printf("Invalid assetmap UUID %s: %v", pkg.AssetMapUUID, err)
+			continue
+		}
+
+		// Upsert package
+		pkgQuery := `
+			INSERT INTO dcp_packages (
+				id, assetmap_uuid, package_name, content_title, content_kind,
+				issue_date, issuer, creator, annotation_text, volume_count,
+				total_size_bytes, file_count, discovered_at, last_verified,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			ON CONFLICT (assetmap_uuid) DO UPDATE SET
+				package_name = EXCLUDED.package_name,
+				content_title = EXCLUDED.content_title,
+				content_kind = EXCLUDED.content_kind,
+				issue_date = EXCLUDED.issue_date,
+				issuer = EXCLUDED.issuer,
+				creator = EXCLUDED.creator,
+				annotation_text = EXCLUDED.annotation_text,
+				volume_count = EXCLUDED.volume_count,
+				total_size_bytes = EXCLUDED.total_size_bytes,
+				file_count = EXCLUDED.file_count,
+				last_verified = EXCLUDED.last_verified,
+				updated_at = CURRENT_TIMESTAMP
+		`
+
+		now := time.Now()
+		_, err = s.db.Exec(pkgQuery,
+			pkgID, assetMapUUID, pkg.PackageName, pkg.ContentTitle, pkg.ContentKind,
+			pkg.IssueDate, pkg.Issuer, pkg.Creator, pkg.AnnotationText, pkg.VolumeCount,
+			pkg.TotalSizeBytes, pkg.FileCount, pkg.DiscoveredAt, pkg.LastVerified,
+			now, now,
+		)
+		if err != nil {
+			log.Printf("Error upserting package %s: %v", pkg.PackageName, err)
+			continue
+		}
+		packagesProcessed++
+
+		// Process compositions
+		for _, comp := range pkg.Compositions {
+			compID, _ := uuid.Parse(comp.ID)
+			cplUUID, _ := uuid.Parse(comp.CPLUUID)
+
+			compQuery := `
+				INSERT INTO dcp_compositions (
+					id, package_id, cpl_uuid, content_title_text, content_kind,
+					issue_date, issuer, creator, edit_rate, frame_rate,
+					screen_aspect_ratio, resolution_width, resolution_height,
+					main_sound_configuration, reel_count, total_duration_frames,
+					created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+				ON CONFLICT (package_id, cpl_uuid) DO UPDATE SET
+					content_title_text = EXCLUDED.content_title_text,
+					content_kind = EXCLUDED.content_kind,
+					updated_at = CURRENT_TIMESTAMP
+			`
+
+			_, err = s.db.Exec(compQuery,
+				compID, pkgID, cplUUID, comp.ContentTitleText, comp.ContentKind,
+				comp.IssueDate, comp.Issuer, comp.Creator, comp.EditRate, comp.FrameRate,
+				comp.ScreenAspectRatio, comp.ResolutionWidth, comp.ResolutionHeight,
+				comp.MainSoundConfiguration, comp.ReelCount, comp.TotalDurationFrames,
+				now, now,
+			)
+			if err != nil {
+				log.Printf("Error upserting composition: %v", err)
+				continue
+			}
+			compositionsProcessed++
+		}
+
+		// Process assets
+		for _, asset := range pkg.Assets {
+			assetID, _ := uuid.Parse(asset.ID)
+			assetUUID, _ := uuid.Parse(asset.AssetUUID)
+
+			assetQuery := `
+				INSERT INTO dcp_assets (
+					id, package_id, asset_uuid, file_path, file_name,
+					asset_type, asset_role, size_bytes, hash_algorithm, hash_value,
+					created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (package_id, asset_uuid) DO UPDATE SET
+					file_path = EXCLUDED.file_path,
+					file_name = EXCLUDED.file_name,
+					size_bytes = EXCLUDED.size_bytes
+			`
+
+			_, err = s.db.Exec(assetQuery,
+				assetID, pkgID, assetUUID, asset.FilePath, asset.FileName,
+				asset.AssetType, asset.AssetRole, asset.SizeBytes, asset.HashAlgorithm, asset.HashValue,
+				now,
+			)
+			if err != nil {
+				log.Printf("Error upserting asset: %v", err)
+				continue
+			}
+			assetsProcessed++
+		}
+	}
+
+	log.Printf("DCP metadata sync from server %s: %d packages, %d compositions, %d assets",
+		serverID, packagesProcessed, compositionsProcessed, assetsProcessed)
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":      "Metadata received",
+		"packages":     packagesProcessed,
+		"compositions": compositionsProcessed,
+		"assets":       assetsProcessed,
 	})
 }
 

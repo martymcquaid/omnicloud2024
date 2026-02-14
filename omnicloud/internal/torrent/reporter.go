@@ -3,6 +3,7 @@ package torrent
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,8 +14,9 @@ import (
 // StatusReporter handles periodic reporting of torrent status to main server
 type StatusReporter struct {
 	client        *Client
-	mainServerURL string
+	db            *sql.DB
 	serverID      string
+	mainServerURL string
 	httpClient    *http.Client
 }
 
@@ -23,6 +25,7 @@ type TorrentStatusReport struct {
 	ServerID   string                 `json:"server_id"`
 	Timestamp  time.Time              `json:"timestamp"`
 	Torrents   []TorrentStatusItem    `json:"torrents"`
+	QueueItems []QueueStatusItem      `json:"queue_items,omitempty"`
 	QueueStats map[string]int         `json:"queue_stats,omitempty"`
 }
 
@@ -40,10 +43,23 @@ type TorrentStatusItem struct {
 	ETA              int     `json:"eta_seconds"`
 }
 
+// QueueStatusItem represents status for a single queue item
+type QueueStatusItem struct {
+	ID              string     `json:"id"`
+	PackageID       string     `json:"package_id"`
+	Status          string     `json:"status"`
+	ProgressPercent float64    `json:"progress_percent"`
+	CurrentFile     string     `json:"current_file,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	TotalSizeBytes  int64      `json:"total_size_bytes,omitempty"`
+	HashingSpeedBps int64      `json:"hashing_speed_bps,omitempty"`
+}
+
 // NewStatusReporter creates a new status reporter
-func NewStatusReporter(client *Client, mainServerURL, serverID string) *StatusReporter {
+func NewStatusReporter(client *Client, db *sql.DB, mainServerURL, serverID string) *StatusReporter {
 	return &StatusReporter{
 		client:        client,
+		db:            db,
 		mainServerURL: mainServerURL,
 		serverID:      serverID,
 		httpClient: &http.Client{
@@ -76,11 +92,8 @@ func (sr *StatusReporter) Start(ctx context.Context) {
 func (sr *StatusReporter) reportStatus() error {
 	// Get all torrent stats
 	stats := sr.client.GetAllStats()
-	if len(stats) == 0 {
-		return nil // Nothing to report
-	}
-
-	// Build report
+	
+	// Build torrent items
 	items := make([]TorrentStatusItem, 0, len(stats))
 	for _, stat := range stats {
 		status := "idle"
@@ -106,10 +119,49 @@ func (sr *StatusReporter) reportStatus() error {
 		})
 	}
 
+	// Get queue items (hashing progress)
+	queueItems := make([]QueueStatusItem, 0)
+	if sr.db != nil {
+		query := `
+			SELECT id, package_id, status, COALESCE(progress_percent, 0), 
+			       COALESCE(current_file, ''), started_at, COALESCE(total_size_bytes, 0),
+			       COALESCE(hashing_speed_bps, 0)
+			FROM torrent_queue
+			WHERE status IN ('queued', 'generating')
+			ORDER BY queued_at
+		`
+		rows, err := sr.db.Query(query)
+		if err != nil {
+			log.Printf("Error querying queue items: %v", err)
+		} else {
+			defer rows.Close()
+			for rows.Next() {
+				var item QueueStatusItem
+				var startedAt sql.NullTime
+				err := rows.Scan(&item.ID, &item.PackageID, &item.Status, &item.ProgressPercent,
+					&item.CurrentFile, &startedAt, &item.TotalSizeBytes, &item.HashingSpeedBps)
+				if err != nil {
+					log.Printf("Error scanning queue item: %v", err)
+					continue
+				}
+				if startedAt.Valid {
+					item.StartedAt = &startedAt.Time
+				}
+				queueItems = append(queueItems, item)
+			}
+		}
+	}
+
+	// Don't report if there's nothing to send
+	if len(items) == 0 && len(queueItems) == 0 {
+		return nil
+	}
+
 	report := TorrentStatusReport{
-		ServerID:  sr.serverID,
-		Timestamp: time.Now(),
-		Torrents:  items,
+		ServerID:   sr.serverID,
+		Timestamp:  time.Now(),
+		Torrents:   items,
+		QueueItems: queueItems,
 	}
 
 	// Send to main server

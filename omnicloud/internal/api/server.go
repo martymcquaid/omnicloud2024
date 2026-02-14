@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -90,6 +92,8 @@ func (s *Server) setupRoutes() {
 	apiAuth.HandleFunc("/dcps", s.handleGetServerDCPs).Methods("GET")
 	apiAuth.HandleFunc("/pending-action", s.handlePendingAction).Methods("GET")
 	apiAuth.HandleFunc("/action-done", s.handleActionDone).Methods("POST")
+	apiAuth.HandleFunc("/torrent-status", s.handleTorrentStatus).Methods("POST")
+	apiAuth.HandleFunc("/dcp-metadata", s.handleDCPMetadata).Methods("POST")
 
 	// DCP routes
 	api.HandleFunc("/dcps", s.handleListDCPs).Methods("GET")
@@ -124,6 +128,10 @@ func (s *Server) setupRoutes() {
 	api.HandleFunc("/servers/{id}/restart", s.handleRestartServer).Methods("POST")
 	api.HandleFunc("/servers/{id}/rescan", s.handleRescanServer).Methods("POST")
 	api.HandleFunc("/servers/{id}/scan-status", s.handleServerScanStatus).Methods("GET")
+
+	// Serve static files for web UI (must be last to not conflict with API routes)
+	webDir := filepath.Join(filepath.Dir(filepath.Dir(os.Args[0])), "web")
+	s.router.PathPrefix("/").Handler(http.FileServer(http.Dir(webDir)))
 
 	log.Println("API routes configured")
 }
