@@ -188,6 +188,13 @@ func main() {
 	// Start scan handler worker with torrent queue
 	scanHandler := watcher.NewScanHandler(database, serverID)
 	scanHandler.GetIndexer().SetTorrentQueue(queueManager)
+	
+	// For client mode, enable torrent downloading from main server
+	if cfg.IsClient() && cfg.MainServerURL != "" {
+		macAddress, _ := dcp.GetMACAddress()
+		scanHandler.GetIndexer().SetClientMode(cfg.MainServerURL, macAddress)
+	}
+	
 	go scanHandler.StartScanWorker(scanRequests, stopChan)
 
 	// Start filesystem watcher
@@ -204,6 +211,12 @@ func main() {
 	// Start periodic scanner
 	periodicScanner := scanner.NewPeriodicScanner(cfg.ScanPath, cfg.ScanInterval, database, serverID)
 	periodicScanner.GetIndexer().SetTorrentQueue(queueManager)
+	
+	// For client mode, enable torrent downloading from main server
+	if cfg.IsClient() && cfg.MainServerURL != "" {
+		macAddress, _ := dcp.GetMACAddress()
+		periodicScanner.GetIndexer().SetClientMode(cfg.MainServerURL, macAddress)
+	}
 	periodicScanner.Start()
 	defer periodicScanner.Stop()
 
@@ -233,6 +246,12 @@ func main() {
 		go updateAgent.Start()
 		defer updateAgent.Stop()
 		log.Println("Update agent started")
+
+		// Start transfer processor for automatic content downloads
+		transferProcessor := torrentpkg.NewTransferProcessor(torrentClient, cfg.MainServerURL, serverID.String(), macAddress)
+		go transferProcessor.Start(ctx)
+		defer transferProcessor.Stop()
+		log.Println("Transfer processor started")
 	} else if cfg.IsMainServer() {
 		// Main servers also need periodic storage updates
 		go func() {

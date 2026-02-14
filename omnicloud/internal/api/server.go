@@ -91,6 +91,7 @@ func (s *Server) setupRoutes() {
 	apiAuth.HandleFunc("/inventory", s.handleUpdateInventory).Methods("POST")
 	apiAuth.HandleFunc("/dcps", s.handleGetServerDCPs).Methods("GET")
 	apiAuth.HandleFunc("/pending-action", s.handlePendingAction).Methods("GET")
+	apiAuth.HandleFunc("/pending-transfers", s.handlePendingTransfers).Methods("GET")
 	apiAuth.HandleFunc("/action-done", s.handleActionDone).Methods("POST")
 	apiAuth.HandleFunc("/torrent-status", s.handleTorrentStatus).Methods("POST")
 	apiAuth.HandleFunc("/dcp-metadata", s.handleDCPMetadata).Methods("POST")

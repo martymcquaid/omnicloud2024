@@ -1,0 +1,185 @@
+---
+description: OmniCloud DCP distribution system architecture and testing setup
+alwaysApply: true
+---
+
+# OmniCloud DCP Distribution System
+
+## What We're Building
+
+OmniCloud is a distributed Digital Cinema Package (DCP) management and distribution system with a hub-and-spoke architecture:
+
+- **Main Server**: Central hub that manages all client sites
+- **Client Servers**: Remote cinema sites that report to and receive content from the main server
+- **BitTorrent Distribution**: Content is distributed via private BitTorrent tracker
+- **Full Control**: Main server has complete visibility and control over all client operations
+
+## System Architecture
+
+### Main Server Responsibilities
+
+1. **Central Management**: Manages all registered client servers
+2. **BitTorrent Tracker**: Runs private tracker for content distribution
+3. **Content Catalog**: Aggregates DCP inventory from all sites
+4. **Transfer Orchestration**: Initiates content transfers to specific sites
+5. **Monitoring**: Receives real-time status from all clients (hash progress, downloads, storage)
+6. **Remote Control**: Can trigger upgrades, restarts, and rescans on clients
+
+### Client Server Responsibilities
+
+1. **Registration**: Auto-register with main server (includes public IP detection)
+2. **Inventory Sync**: Report all DCP packages to main server every 5 minutes
+3. **Metadata Sync**: Send complete DCP metadata (packages, compositions, assets) every 5 minutes
+4. **Torrent Status**: Report hashing progress and download/seed status every 10 seconds
+5. **Heartbeat**: Send storage capacity and software version every 5 minutes
+6. **Transfer Polling**: Check for queued content transfers every 30 seconds
+7. **Command Execution**: Poll for and execute upgrade/restart/rescan commands every 60 seconds
+
+## Key Communication Flows
+
+### Client → Main Server
+
+```
+Client sends to Main Server:
+├─ Registration (startup)
+│  └─ Server name, location, public IP, MAC, storage capacity, version
+├─ Inventory Updates (every 5 min)
+│  └─ List of all DCP packages with UUIDs and paths
+├─ DCP Metadata (every 5 min)
+│  └─ Full package details: compositions, assets, sizes, hashes
+├─ Torrent Status (every 10 sec)
+│  └─ Active downloads/seeds + hash generation progress
+├─ Heartbeat (every 5 min)
+│  └─ Storage capacity, version, package count
+└─ Transfer Polling (every 30 sec)
+   └─ Check for queued transfers targeting this client
+```
+
+### Main Server → Client
+
+```
+Main Server commands to Client:
+├─ Upgrade Command
+│  └─ Sets target version, client downloads and installs
+├─ Restart Command
+│  └─ Triggers systemd service restart
+├─ Rescan Command
+│  └─ Direct API call to trigger library rescan
+└─ Transfer Creation
+   └─ Creates transfer record, client auto-discovers and downloads
+```
+
+## Local Testing Setup
+
+We run TWO instances on the same server for testing client-main communication:
+
+### Instance 1: Main Server
+- **Directory**: `/home/appbox/DCPCLOUDAPP/omnicloud/`
+- **Port**: 10858
+- **Mode**: `server_mode=main`
+- **Config**: `omnicloud/auth.config`
+- **Library**: `/APPBOX_DATA/storage/DCP/TESTLIBRARY/`
+- **Run Script**: `omnicloud/run.sh`
+
+### Instance 2: Test Client
+- **Directory**: `/home/appbox/DCPCLOUDAPP/omnicloud-client/`
+- **Port**: 10859
+- **Mode**: `server_mode=client`
+- **Config**: `omnicloud-client/auth.config`
+- **Main Server URL**: `http://localhost:10858`
+- **Library**: Same test library (simulates remote site)
+- **Run Script**: `omnicloud-client/run.sh`
+
+### Unified Control Script
+- **Script**: `/home/appbox/DCPCLOUDAPP/test-env.sh`
+- **Commands**:
+  - `./test-env.sh start` - Start both instances
+  - `./test-env.sh stop` - Stop both instances
+  - `./test-env.sh status` - Check status of both
+  - `./test-env.sh logs` - Follow logs from both
+  - `./test-env.sh main start` - Control main server only
+  - `./test-env.sh client stop` - Control test client only
+
+## Important File Paths
+
+### Source Code
+- `omnicloud/internal/api/client_sync.go` - Client sync service
+- `omnicloud/internal/api/handlers.go` - Main API handlers
+- `omnicloud/internal/torrent/transfer_processor.go` - Transfer polling
+- `omnicloud/internal/torrent/reporter.go` - Status reporter
+- `omnicloud/internal/updater/agent.go` - Update agent
+- `omnicloud/cmd/omnicloud/main.go` - Application entry point
+
+### Configuration Files
+- `auth.config` - Main server config (gitignored)
+- `omnicloud-client/auth.config` - Test client config (gitignored)
+- `.gitignore` - Includes config files to prevent git overwrites
+
+### Build & Deployment
+- `omnicloud/Makefile` - Build commands
+- `omnicloud/bin/omnicloud` - Compiled binary
+- `omnicloud-client/bin/omnicloud` - Client binary (copy of main)
+
+## Testing Workflow
+
+### 1. Build Latest Code
+```bash
+cd omnicloud && make build
+```
+
+### 2. Update Both Instances
+```bash
+# Stop both
+./test-env.sh stop
+
+# Copy binary to client
+cp omnicloud/bin/omnicloud omnicloud-client/bin/
+
+# Start both
+./test-env.sh start
+```
+
+### 3. Verify Communication
+```bash
+# Check both are running
+./test-env.sh status
+
+# Check client logs for sync activity
+grep "Client sync\|Transfer processor\|Update agent" omnicloud-client/omnicloud-client.log
+
+# Check main server sees all servers
+curl -s http://localhost:10858/api/v1/servers | python3 -m json.tool
+```
+
+### 4. Test Transfer Flow
+```bash
+# Create a transfer via API
+curl -X POST http://localhost:10858/api/v1/transfers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "torrent_id": "<uuid>",
+    "destination_server_id": "<client-uuid>",
+    "requested_by": "test",
+    "priority": 5
+  }'
+
+# Watch client logs for transfer discovery
+tail -f omnicloud-client/omnicloud-client.log | grep "Transfer"
+```
+
+## Key Design Patterns
+
+1. **Config Protection**: Local configs are gitignored to prevent git pull overwrites
+2. **Public IP Detection**: Clients auto-detect public IP via external services (ipify.org, etc.)
+3. **Polling Pattern**: Clients poll main server for commands (no push mechanism)
+4. **Transfer Auto-Discovery**: Clients automatically find and execute queued transfers
+5. **BitTorrent for Distribution**: All content transfers use private BitTorrent tracker
+6. **Comprehensive Sync**: Clients send complete inventory, metadata, and real-time status
+
+## Development Notes
+
+- Always rebuild both binaries when changing shared code
+- Test client uses same database as main (different server_id)
+- Logs show duplicate lines (expected - some services log twice)
+- Public IP detection may timeout locally (use localhost for testing)
+- Transfer processor polls every 30 seconds - allow time for discovery

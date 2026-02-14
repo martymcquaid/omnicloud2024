@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/omnicloud/omnicloud/internal/db"
 	"github.com/omnicloud/omnicloud/internal/parser"
+	torrentpkg "github.com/omnicloud/omnicloud/internal/torrent"
 )
 
 // TorrentQueue interface for adding packages to torrent queue
@@ -18,9 +19,13 @@ type TorrentQueue interface {
 
 // Indexer handles storing DCP metadata to the database
 type Indexer struct {
-	db           *db.DB
-	serverID     uuid.UUID
-	torrentQueue TorrentQueue
+	db               *db.DB
+	serverID         uuid.UUID
+	torrentQueue     TorrentQueue
+	torrentDownloader *torrentpkg.TorrentDownloader
+	isClientMode     bool
+	mainServerURL    string
+	macAddress       string
 }
 
 // NewIndexer creates a new indexer instance
@@ -29,7 +34,16 @@ func NewIndexer(database *db.DB, serverID uuid.UUID) *Indexer {
 		db:           database,
 		serverID:     serverID,
 		torrentQueue: nil, // Set later with SetTorrentQueue
+		isClientMode: false,
 	}
+}
+
+// SetClientMode configures the indexer for client mode with torrent downloading
+func (idx *Indexer) SetClientMode(mainServerURL, macAddress string) {
+	idx.isClientMode = true
+	idx.mainServerURL = mainServerURL
+	idx.macAddress = macAddress
+	idx.torrentDownloader = torrentpkg.NewTorrentDownloader(idx.db.DB, mainServerURL, idx.serverID.String(), macAddress)
 }
 
 // SetTorrentQueue sets the torrent queue manager
@@ -411,6 +425,25 @@ func (idx *Indexer) checkTorrentStatus(packageID uuid.UUID, assetMapUUID uuid.UU
 	if torrentExists {
 		log.Printf("Torrent already exists for package %s", packageID)
 		return nil
+	}
+
+	// For client servers, try to download existing torrent from main server first
+	if idx.isClientMode && idx.torrentDownloader != nil {
+		// Get package path from inventory
+		var packagePath string
+		pathQuery := `SELECT local_path FROM server_dcp_inventory WHERE server_id = $1 AND package_id = $2`
+		err := idx.db.DB.QueryRow(pathQuery, idx.serverID.String(), packageID.String()).Scan(&packagePath)
+		if err == nil && packagePath != "" {
+			downloaded, err := idx.torrentDownloader.TryDownloadExistingTorrent(packageID, packagePath)
+			if err != nil {
+				log.Printf("Warning: failed to download torrent from main server: %v", err)
+				// Fall through to local generation
+			} else if downloaded {
+				log.Printf("Successfully downloaded existing torrent for package %s, skipping local generation", packageID)
+				return nil
+			}
+			// If torrent doesn't exist on main server, fall through to local generation
+		}
 	}
 
 	// Check if already in queue

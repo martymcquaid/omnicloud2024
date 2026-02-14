@@ -1189,6 +1189,72 @@ func (s *Server) handlePendingAction(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]interface{}{"action": nil})
 }
 
+// handlePendingTransfers returns transfers queued for a specific server
+func (s *Server) handlePendingTransfers(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	// Query transfers where destination_server_id matches and status is 'queued'
+	rows, err := s.database.Query(`
+		SELECT 
+			t.id, 
+			t.torrent_id, 
+			t.source_server_id,
+			t.destination_server_id,
+			t.priority,
+			COALESCE(dp.id, '') as package_id,
+			COALESCE(dp.package_name, '') as package_name,
+			COALESCE(dp.total_size_bytes, 0) as total_size_bytes,
+			dt.info_hash
+		FROM transfers t
+		LEFT JOIN dcp_torrents dt ON t.torrent_id = dt.id
+		LEFT JOIN dcp_packages dp ON dt.package_id = dp.id
+		WHERE t.destination_server_id = $1 AND t.status = 'queued'
+		ORDER BY t.priority DESC, t.created_at ASC
+		LIMIT 10
+	`, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	transfers := []map[string]interface{}{}
+	for rows.Next() {
+		var id, torrentID, sourceServerID, destServerID uuid.UUID
+		var priority int
+		var packageID, packageName string
+		var totalSizeBytes int64
+		var infoHash string
+
+		if err := rows.Scan(&id, &torrentID, &sourceServerID, &destServerID, &priority,
+			&packageID, &packageName, &totalSizeBytes, &infoHash); err != nil {
+			log.Printf("Error scanning transfer row: %v", err)
+			continue
+		}
+
+		transfer := map[string]interface{}{
+			"id":                    id,
+			"torrent_id":            torrentID,
+			"package_id":            packageID,
+			"package_name":          packageName,
+			"source_server_id":      sourceServerID,
+			"destination_server_id": destServerID,
+			"priority":              priority,
+			"total_size_bytes":      totalSizeBytes,
+			"torrent_file_url":      fmt.Sprintf("/api/v1/torrents/%s/file", torrentID),
+		}
+
+		transfers = append(transfers, transfer)
+	}
+
+	respondJSON(w, http.StatusOK, transfers)
+}
+
 // handleActionDone clears the pending action after the agent has completed restart or upgrade
 func (s *Server) handleActionDone(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
