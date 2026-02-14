@@ -49,7 +49,7 @@ func Load(configPath string) (*Config, error) {
 		DBHost:         "localhost",
 		DBPort:         5432,
 		DBName:         "OmniCloud",
-		ScanPath:       "/APPBOX_DATA/storage/DCP/Archive/",
+		ScanPath:       "/library/omnicloud/testlibrary",
 		APIPort:        10858,
 		ScanInterval:   12,
 		ServerName:     getHostname(),
@@ -60,7 +60,7 @@ func Load(configPath string) (*Config, error) {
 		
 		// Torrent defaults
 		TrackerPort:            10859,
-		TorrentDataDir:         "/APPBOX_DATA/storage/DCP/Downloads",
+		TorrentDataDir:         "/opt/OmniCloud/omnicloud2024/omnicloud/data/torrents",
 		MaxUploadRate:          0, // unlimited
 		MaxDownloadRate:        0, // unlimited
 		MaxConcurrentSeeds:          50,

@@ -69,6 +69,26 @@ else
     echo -e "${GREEN}✓ PostgreSQL found${NC}"
 fi
 
+# Ensure PostgreSQL is running and accepting connections (Debian/Ubuntu: pg_ctlcluster 12 main may be used)
+if ! systemctl is-active --quiet postgresql 2>/dev/null; then
+    echo -e "${YELLOW}Starting PostgreSQL...${NC}"
+    systemctl start postgresql || true
+    if command -v pg_ctlcluster &>/dev/null; then
+        pg_ctlcluster 12 main start 2>/dev/null || true
+    fi
+fi
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if sudo -u postgres psql -d postgres -c "SELECT 1" &>/dev/null; then
+        break
+    fi
+    echo "  Waiting for PostgreSQL to accept connections..."
+    sleep 2
+done
+if ! sudo -u postgres psql -d postgres -c "SELECT 1" &>/dev/null; then
+    echo -e "${RED}Error: PostgreSQL is not accepting connections. Check: sudo systemctl status postgresql; sudo -u postgres psql -c 'SELECT 1'${NC}"
+    exit 1
+fi
+
 # Create system user
 echo ""
 echo "[3/12] Creating system user..."
@@ -86,6 +106,8 @@ mkdir -p /opt/omnicloud/bin
 mkdir -p /opt/omnicloud/data
 mkdir -p /var/log/omnicloud
 mkdir -p /etc/omnicloud
+mkdir -p /library/omnicloud/testlibrary
+chown -R omnicloud:omnicloud /library/omnicloud 2>/dev/null || true
 
 chown -R omnicloud:omnicloud /opt/omnicloud
 chown -R omnicloud:omnicloud /var/log/omnicloud
@@ -98,15 +120,29 @@ echo "[5/12] Setting up database..."
 # Generate random password
 DB_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
-# Create database and user
-sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='omni'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER omni WITH PASSWORD '$DB_PASSWORD';"
+# Create role and database in same session (same cluster) to avoid "database does not exist" on Debian/Ubuntu
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres <<EOSQL
+-- Create role if not exists
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'omni') THEN
+    CREATE USER omni WITH PASSWORD '$DB_PASSWORD';
+  END IF;
+END
+\$\$;
+EOSQL
 
-sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='OmniCloud'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE DATABASE OmniCloud OWNER omni;"
+# Create database (ignore error if already exists, e.g. re-run)
+sudo -u postgres psql -d postgres -c "CREATE DATABASE \"OmniCloud\" OWNER omni;" 2>/dev/null || true
 
-sudo -u postgres psql -d OmniCloud -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
-sudo -u postgres psql -d OmniCloud -c "GRANT ALL PRIVILEGES ON DATABASE OmniCloud TO omni;"
+# Extension and grants (same cluster; PostgreSQL is now up and DB exists)
+# uuid-ossp required for uuid_generate_v4() (PG12); pgcrypto for migrations
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d OmniCloud -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d OmniCloud -c "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\";"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d OmniCloud -c "GRANT ALL PRIVILEGES ON DATABASE \"OmniCloud\" TO omni;"
+
+# If role was pre-existing, ensure password is set (idempotent)
+sudo -u postgres psql -d postgres -c "ALTER USER omni WITH PASSWORD '$DB_PASSWORD';" 2>/dev/null || true
 
 echo -e "${GREEN}✓ Database 'OmniCloud' created${NC}"
 
@@ -177,8 +213,11 @@ registration_key=$REG_KEY
 # Main server URL
 main_server_url=$MAIN_URL
 
-# DCP archive path (update this with your DCP storage path)
-scan_path=/path/to/dcp/library
+# DCP archive path (default: /library/omnicloud/testlibrary - create or set your own)
+scan_path=/library/omnicloud/testlibrary
+
+# Torrent data directory
+torrent_data_dir=/opt/omnicloud/data/torrents
 
 # Periodic scan interval in hours
 scan_interval=12

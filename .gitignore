@@ -1,0 +1,6 @@
+# Runtime / local
+omnicloud/omnicloud.log
+omnicloud/omnicloud.pid
+omnicloud/data/
+*.log
+*.pid
