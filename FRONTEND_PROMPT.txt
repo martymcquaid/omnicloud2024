@@ -1,0 +1,1120 @@
+===========================================
+OMNICLOUD FRONTEND - COMPREHENSIVE BUILD PROMPT
+===========================================
+
+PROJECT OVERVIEW
+===========================================
+
+Build a modern, production-ready React frontend for OmniCloud - a distributed Digital Cinema Package (DCP) management and distribution system for cinema networks.
+
+OmniCloud enables multiple cinema sites to:
+- View their complete DCP library inventory across all locations
+- Share DCPs between sites using BitTorrent technology
+- Monitor real-time transfer progress and torrent seeding status
+- Manage server registrations and authorizations
+- Track storage capacity and DCP metadata across the network
+
+This is a mission-critical application for cinema operations - it must be reliable, performant, and intuitive.
+
+===========================================
+SYSTEM ARCHITECTURE
+===========================================
+
+BACKEND API:
+- Base URL: http://localhost:10858/api/v1
+- Protocol: REST API with JSON responses
+- No authentication required (internal network)
+- CORS enabled for all origins
+
+SERVER MODES:
+1. MAIN SERVER - Central hub that:
+   - Runs BitTorrent tracker on port 10859
+   - Maintains global DCP registry
+   - Receives inventory reports from client sites
+   - Manages transfer requests
+   - Stores all .torrent files
+
+2. CLIENT SITES - Individual cinema locations that:
+   - Maintain local DCP inventory
+   - Report inventory to main server
+   - Generate/seed/download torrents
+   - Execute transfer requests
+
+===========================================
+COMPLETE API DOCUMENTATION
+===========================================
+
+BASE URL: http://localhost:10858/api/v1
+
+--- HEALTH & STATUS ---
+
+GET /health
+Response: {
+  "status": "healthy",
+  "time": "2026-02-13T21:36:07.939438763Z",
+  "version": "1.0.0"
+}
+
+--- SERVER MANAGEMENT ---
+
+GET /servers
+Returns: Array of server objects
+Response: [{
+  "id": "uuid",
+  "name": "string",
+  "location": "string",
+  "api_url": "string",
+  "mac_address": "string",
+  "is_authorized": boolean,
+  "last_seen": "timestamp",
+  "storage_capacity_tb": number,
+  "created_at": "timestamp"
+}]
+
+POST /servers/register
+Body: {
+  "name": "string",
+  "location": "string",
+  "api_url": "string",
+  "mac_address": "string",
+  "registration_key": "string",
+  "storage_capacity_tb": number
+}
+Response: {
+  "id": "uuid",
+  "message": "Server registered successfully"
+}
+
+POST /servers/{id}/heartbeat
+Updates last_seen timestamp for a server
+Response: { "message": "Heartbeat received" }
+
+GET /servers/{id}/dcps
+Returns all DCPs that a specific server has in inventory
+
+--- DCP MANAGEMENT ---
+
+GET /dcps
+Query params:
+  - package_name (optional): filter by name
+  - content_kind (optional): filter by type (feature, trailer, etc.)
+Returns: Array of DCP packages
+Response: [{
+  "id": "uuid",
+  "assetmap_uuid": "uuid",
+  "package_name": "string",
+  "content_title": "string",
+  "content_kind": "string",
+  "issuer": "string",
+  "creator": "string",
+  "volume_count": number,
+  "total_size_bytes": number,
+  "file_count": number,
+  "discovered_at": "timestamp",
+  "last_verified": "timestamp"
+}]
+
+GET /dcps/{uuid}
+Returns detailed information about a specific DCP package
+
+--- TORRENT MANAGEMENT ---
+
+GET /torrents
+Query params:
+  - package_id (optional): filter by package UUID
+  - assetmap_uuid (optional): filter by DCP assetmap UUID
+Returns: Array of registered torrents
+Response: [{
+  "id": "uuid",
+  "package_id": "uuid",
+  "info_hash": "string (40 chars hex)",
+  "piece_size": number,
+  "total_pieces": number,
+  "file_count": number,
+  "total_size_bytes": number,
+  "created_by_server_id": "uuid",
+  "created_at": "timestamp"
+}]
+
+GET /torrents/{info_hash}
+Returns detailed torrent information
+
+GET /torrents/{info_hash}/file
+Downloads the .torrent file (binary)
+Content-Type: application/x-bittorrent
+
+POST /torrents
+Registers a new torrent (used by queue workers)
+Query params: package_id, server_id
+Body: .torrent file (binary)
+
+GET /torrents/{info_hash}/seeders
+Returns all servers currently seeding this torrent
+Response: [{
+  "id": "uuid",
+  "torrent_id": "uuid",
+  "server_id": "uuid",
+  "server_name": "string",
+  "local_path": "string",
+  "status": "seeding|paused|error",
+  "uploaded_bytes": number,
+  "last_announce": "timestamp"
+}]
+
+POST /torrents/{info_hash}/seeders
+Registers a server as a seeder for this torrent
+Body: {
+  "server_id": "uuid",
+  "local_path": "string"
+}
+
+--- TRANSFER MANAGEMENT ---
+
+GET /transfers
+Query params:
+  - server_id (optional): filter by source or destination server
+  - status (optional): filter by status
+Returns: Array of transfer requests
+Response: [{
+  "id": "uuid",
+  "torrent_id": "uuid",
+  "package_id": "uuid",
+  "package_name": "string",
+  "source_server_id": "uuid|null",
+  "destination_server_id": "uuid",
+  "requested_by": "string",
+  "status": "queued|downloading|completed|failed|cancelled",
+  "priority": number,
+  "progress_percent": number,
+  "downloaded_bytes": number,
+  "download_speed_bps": number,
+  "upload_speed_bps": number,
+  "peers_connected": number,
+  "eta_seconds": number|null,
+  "error_message": "string|null",
+  "started_at": "timestamp|null",
+  "completed_at": "timestamp|null",
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}]
+
+POST /transfers
+Creates a new transfer request
+Body: {
+  "torrent_id": "uuid",
+  "destination_server_id": "uuid",
+  "requested_by": "string",
+  "priority": number (1-10, default 5)
+}
+Response: {
+  "id": "uuid",
+  "message": "Transfer created successfully"
+}
+
+GET /transfers/{id}
+Returns detailed transfer information
+
+PUT /transfers/{id}
+Updates transfer progress (used by clients during download)
+Body: {
+  "status": "string",
+  "progress_percent": number,
+  "downloaded_bytes": number,
+  "download_speed_bps": number,
+  "upload_speed_bps": number,
+  "peers_connected": number,
+  "eta_seconds": number,
+  "error_message": "string"
+}
+
+DELETE /transfers/{id}
+Cancels a transfer (sets status to 'cancelled')
+
+===========================================
+FRONTEND REQUIREMENTS
+===========================================
+
+TECHNOLOGY STACK:
+- React 18+ with hooks
+- TypeScript for type safety
+- Modern styling: Tailwind CSS or Material-UI
+- State management: React Query for API calls + Zustand/Context for global state
+- Routing: React Router v6
+- HTTP client: Axios
+- Real-time updates: Polling every 5 seconds for active transfers, 30 seconds for everything else
+- Data visualization: Recharts for graphs/stats
+- Icons: Lucide React or React Icons
+- Build tool: Vite
+- Responsive design: Mobile-first, works on tablets/desktops
+
+===========================================
+CORE FEATURES & PAGES
+===========================================
+
+1. DASHBOARD (Home Page)
+   Purpose: Overview of entire OmniCloud network
+   
+   Sections:
+   - System Health
+     * API status indicator (green/red dot)
+     * Total DCPs across all sites
+     * Total storage used (TB)
+     * Active transfers count
+     * Active torrents being generated/seeded
+   
+   - Quick Stats Cards
+     * Total Sites (with authorized/unauthorized breakdown)
+     * Total DCPs
+     * Active Transfers
+     * Torrent Queue Status (queued/generating/completed/failed)
+   
+   - Recent Activity Feed
+     * Last 10 DCPs indexed
+     * Recent transfer requests
+     * Completed transfers
+     * New servers registered
+   
+   - Active Transfers Widget
+     * Live progress bars for ongoing downloads
+     * Speed indicators (MB/s)
+     * ETA countdown
+     * Peer counts
+
+2. DCP LIBRARY (Main Feature)
+   Purpose: Browse and search all DCPs across network
+   
+   Features:
+   - Searchable table with columns:
+     * Package Name (sortable, searchable)
+     * Content Title (sortable)
+     * Content Kind (feature/trailer/advertisement)
+     * Size (human-readable: GB/TB)
+     * File Count
+     * Sites Having It (badge count, click to expand list)
+     * Actions (Transfer button, View Details button)
+   
+   - Filters:
+     * Content Kind dropdown (feature, trailer, advertisement, etc.)
+     * Issuer filter
+     * Size range slider
+     * Date range (discovered_at)
+     * Server filter (show DCPs on specific server)
+   
+   - Advanced Features:
+     * Bulk selection (checkboxes)
+     * Bulk transfer (select multiple DCPs, pick destination)
+     * Export to CSV
+     * Column visibility toggle
+     * Pagination (50/100/500 per page)
+   
+   - DCP Detail Modal (click row):
+     * All metadata (assetmap UUID, issuer, creator, dates)
+     * Composition details (CPL info, reels, resolution)
+     * Asset list (files with sizes and hashes)
+     * Torrent info (if exists: info_hash, piece size, seeders list)
+     * Inventory locations (which servers have it, with paths)
+     * Transfer history (past/current transfers for this DCP)
+     * Quick Actions:
+       - Initiate Transfer button
+       - Download .torrent file button
+       - View in Tracker button
+
+3. SERVERS PAGE
+   Purpose: Manage all sites in the network
+   
+   Features:
+   - Server Cards Grid (or table view toggle)
+   - Each card shows:
+     * Server name + location
+     * Status indicator (online if last_seen < 5 min ago)
+     * Authorization status (badge: Authorized/Unauthorized)
+     * MAC address
+     * Storage capacity
+     * DCP count (how many DCPs this server has)
+     * Active transfers (uploading/downloading)
+     * Last seen timestamp (human-readable: "2 minutes ago")
+   
+   - Actions per server:
+     * View DCPs button (filters DCP library to this server)
+     * Initiate Transfer To This Server button
+     * Edit details (location, capacity)
+     * Authorize/Deauthorize toggle (main server only)
+   
+   - Add New Server Button:
+     * Form: name, location, API URL, MAC address, registration key
+     * Calls POST /servers/register
+
+4. TRANSFERS PAGE
+   Purpose: Monitor and manage all DCP transfers
+   
+   Views:
+   A) Active Transfers Tab
+      - Real-time updating list (poll every 5 seconds)
+      - Shows status: queued, downloading, completed, failed
+      - For each transfer:
+        * DCP name + package size
+        * Source → Destination (server names)
+        * Progress bar with % and speed
+        * Downloaded / Total (GB)
+        * Download speed (MB/s)
+        * Upload speed (MB/s)
+        * Peers connected
+        * ETA (hours:minutes remaining)
+        * Action buttons: Cancel (for queued/downloading)
+   
+   B) Transfer History Tab
+      - Filterable table of all transfers
+      - Filters: status, date range, server, DCP name
+      - Sortable by: created_at, completed_at, priority
+      - Shows: requested_by, started_at, completed_at, error_message
+   
+   C) Create New Transfer Form (modal or separate page)
+      - Step 1: Select DCP (searchable dropdown)
+      - Step 2: Choose destination server (dropdown with status indicators)
+      - Step 3: Set priority (slider 1-10)
+      - Step 4: Add note (requested_by field)
+      - Confirmation: Shows estimated size, available seeders
+      - Submit button → POST /transfers
+
+5. TORRENTS PAGE
+   Purpose: Monitor torrent generation and seeding
+   
+   Sections:
+   A) Torrent Registry
+      - Table of all generated torrents
+      - Columns:
+        * DCP Name (linked to DCP detail)
+        * Info Hash (monospace, copyable)
+        * Piece Size (human-readable)
+        * Total Size
+        * Created By (server name)
+        * Seeders Count (live badge)
+        * Created At
+        * Actions: Download .torrent, View Seeders
+   
+   B) Generation Queue
+      - Shows torrent_queue items
+      - Live updates (poll every 10 seconds)
+      - Status badges: queued, generating, completed, failed
+      - Progress bars for items in "generating" state
+      - Current file being hashed (for generating items)
+      - Retry button for failed items
+      - Clear completed button
+   
+   C) Seeding Status
+      - Live view of which servers are seeding which torrents
+      - Shows upload stats per server
+      - Last announce time
+      - Auto-refresh every 30 seconds
+
+6. ANALYTICS PAGE (Optional but Recommended)
+   Purpose: Visualize network statistics
+   
+   Charts:
+   - DCPs by Content Kind (pie chart)
+   - Storage Distribution by Server (bar chart)
+   - Transfer Activity Over Time (line chart)
+   - Top 10 Most Transferred DCPs (bar chart)
+   - Average Transfer Speeds by Server (comparison chart)
+   - Torrent Generation Queue Trends
+
+===========================================
+UI/UX DESIGN SPECIFICATIONS
+===========================================
+
+THEME:
+- Modern dark theme (primary) with light theme toggle
+- Color palette:
+  * Primary: Deep blue (#1e40af)
+  * Secondary: Cyan (#06b6d4)
+  * Success: Green (#10b981)
+  * Warning: Amber (#f59e0b)
+  * Error: Red (#ef4444)
+  * Background Dark: #0f172a
+  * Background Light: #f8fafc
+  * Cards: #1e293b (dark) / white (light)
+
+LAYOUT:
+- Sidebar navigation (collapsible on mobile)
+- Top bar with:
+  * OmniCloud logo/title
+  * Global search (searches DCPs by name/title)
+  * Server selector dropdown (filters entire UI to specific server)
+  * Notifications bell (shows alerts for failed transfers, new DCPs)
+  * Theme toggle
+  * Current server indicator (which server the UI is managing)
+
+NAVIGATION STRUCTURE:
+- Dashboard (home icon)
+- DCP Library (film/video icon)
+- Servers (server/globe icon)
+- Transfers (arrows icon)
+- Torrents (download icon)
+- Analytics (chart icon) [optional]
+- Settings (gear icon)
+
+COMPONENT STANDARDS:
+- Loading states: Skeleton screens or spinners
+- Empty states: Friendly illustrations with action prompts
+- Error states: Clear error messages with retry buttons
+- Confirmation dialogs for destructive actions (cancel transfer, delete server)
+- Toast notifications for success/error feedback
+- Responsive tables that collapse to cards on mobile
+- Infinite scroll or pagination for large datasets
+
+STATUS INDICATORS:
+- Online/Offline servers: Green/gray dot
+- Transfer statuses:
+  * Queued: Blue badge
+  * Downloading: Animated blue progress
+  * Completed: Green checkmark
+  * Failed: Red X with error tooltip
+  * Cancelled: Gray
+- Torrent statuses:
+  * Queued: Blue
+  * Generating: Yellow with spinner
+  * Seeding: Green with upload icon
+  * Completed: Green checkmark
+  * Failed: Red X
+
+===========================================
+KEY FEATURE IMPLEMENTATIONS
+===========================================
+
+FEATURE 1: INITIATE TRANSFER
+Flow:
+1. User clicks "Transfer" button on a DCP (from library or detail view)
+2. Modal opens with form:
+   - Shows DCP name, size, available seeders count
+   - Destination server dropdown (filterable, shows online status)
+   - Multi-select option: "Transfer to all sites" checkbox
+   - Priority slider (1-10, default 5)
+   - Requested by field (defaults to "Admin" or system username)
+3. Validation:
+   - Ensure destination server is authorized
+   - Check if DCP torrent exists (if not, show "Torrent needs to be generated first")
+   - Warn if no seeders available
+4. Submit:
+   - POST /transfers for each destination
+   - Show success toast with transfer IDs
+   - Redirect to Transfers page
+5. Real-time updates:
+   - Transfer appears in Active Transfers
+   - Progress updates every 5 seconds
+   - Show speed, ETA, peers
+
+FEATURE 2: BULK TRANSFER
+Flow:
+1. User selects multiple DCPs (checkboxes)
+2. Clicks "Bulk Transfer" button in toolbar
+3. Modal shows:
+   - Count of selected DCPs
+   - Total size
+   - Destination options:
+     * Single server (dropdown)
+     * Multiple servers (multi-select)
+     * All authorized servers (checkbox)
+   - Priority for all transfers
+4. Submit creates multiple transfer requests
+5. Confirmation: "Created 25 transfer requests"
+
+FEATURE 3: REAL-TIME MONITORING
+Implementation:
+- Use React Query with refetch intervals:
+  * Active transfers: 5 seconds
+  * Torrent queue: 10 seconds
+  * Server list: 30 seconds
+  * Everything else: 60 seconds
+- Show last updated timestamp
+- "Refresh" button to force fetch
+- Websocket support (future enhancement placeholder)
+
+FEATURE 4: SEARCH & FILTER
+- Global search bar (searches across all DCPs)
+- Per-page advanced filters (sidebar)
+- Filter persistence (save to localStorage)
+- Quick filters: "My Server Only", "Recently Added", "Large Files (>100GB)"
+- Saved filter presets
+
+FEATURE 5: SERVER AUTHORIZATION
+- Main server sees "Authorize/Deauthorize" toggle for each server
+- Unauthorized servers:
+  * Can register
+  * Cannot create transfers
+  * Cannot download torrents
+  * Show warning badge
+- Authorization flow:
+  * Server registers with MAC + registration key
+  * Admin reviews on Servers page
+  * Click authorize → updates is_authorized flag
+
+===========================================
+DATA MODELS (TypeScript Interfaces)
+===========================================
+
+interface Server {
+  id: string;
+  name: string;
+  location: string;
+  api_url: string;
+  mac_address: string;
+  is_authorized: boolean;
+  last_seen: string;
+  storage_capacity_tb: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DCPPackage {
+  id: string;
+  assetmap_uuid: string;
+  package_name: string;
+  content_title: string;
+  content_kind: string;
+  issue_date?: string;
+  issuer: string;
+  creator: string;
+  volume_count: number;
+  total_size_bytes: number;
+  file_count: number;
+  discovered_at: string;
+  last_verified?: string;
+}
+
+interface Torrent {
+  id: string;
+  package_id: string;
+  info_hash: string;
+  piece_size: number;
+  total_pieces: number;
+  file_count: number;
+  total_size_bytes: number;
+  created_by_server_id: string;
+  created_at: string;
+}
+
+interface Seeder {
+  id: string;
+  torrent_id: string;
+  server_id: string;
+  server_name?: string;
+  local_path: string;
+  status: 'seeding' | 'paused' | 'error';
+  uploaded_bytes: number;
+  last_announce: string;
+}
+
+interface Transfer {
+  id: string;
+  torrent_id: string;
+  package_id?: string;
+  package_name?: string;
+  source_server_id?: string;
+  destination_server_id: string;
+  requested_by: string;
+  status: 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  priority: number;
+  progress_percent: number;
+  downloaded_bytes: number;
+  download_speed_bps: number;
+  upload_speed_bps: number;
+  peers_connected: number;
+  eta_seconds?: number;
+  error_message?: string;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface TorrentQueueItem {
+  id: string;
+  package_id: string;
+  package_name?: string;
+  server_id: string;
+  status: 'queued' | 'generating' | 'completed' | 'failed';
+  progress_percent: number;
+  current_file?: string;
+  error_message?: string;
+  queued_at: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+===========================================
+UTILITY FUNCTIONS TO IMPLEMENT
+===========================================
+
+// Format bytes to human-readable
+formatBytes(bytes: number): string
+Examples: 1024 → "1 KB", 1073741824 → "1 GB", 1099511627776 → "1 TB"
+
+// Format speed to human-readable
+formatSpeed(bytesPerSecond: number): string
+Examples: 1048576 → "1 MB/s", 104857600 → "100 MB/s"
+
+// Format ETA to human-readable
+formatETA(seconds: number): string
+Examples: 65 → "1m 5s", 3665 → "1h 1m", 86400 → "1d"
+
+// Calculate progress percentage
+calculateProgress(downloaded: number, total: number): number
+
+// Format timestamp to relative time
+formatRelativeTime(timestamp: string): string
+Examples: "2 minutes ago", "5 hours ago", "3 days ago"
+
+// Get status badge color
+getStatusColor(status: string): string
+
+// Check if server is online
+isServerOnline(lastSeen: string): boolean
+Logic: lastSeen within last 5 minutes = online
+
+===========================================
+SPECIFIC UI COMPONENTS TO BUILD
+===========================================
+
+1. TransferProgressCard
+   Props: transfer object
+   Display:
+   - DCP name as title
+   - Source → Destination with arrow
+   - Animated progress bar with percentage
+   - Speed gauges (download/upload)
+   - Peer count badge
+   - ETA countdown
+   - Cancel button (if not completed)
+   - Auto-updates every 5 seconds
+
+2. DCPCard / DCPRow
+   Props: DCP object, onTransfer callback
+   Display:
+   - Package name (bold)
+   - Content title (subtitle)
+   - Size badge
+   - Content kind badge
+   - Sites badge (count with tooltip showing server names)
+   - Actions: Transfer, Details, Download Torrent (if exists)
+
+3. ServerCard
+   Props: server object
+   Display:
+   - Server name + location
+   - Status indicator (online/offline)
+   - Authorization badge
+   - Stats: DCP count, active transfers
+   - Actions: View DCPs, Transfer To, Authorize toggle
+   - Last seen timestamp
+
+4. TorrentQueueItem
+   Props: queue item
+   Display:
+   - Package name
+   - Status badge
+   - Progress bar (if generating)
+   - Current file being hashed
+   - Error message (if failed)
+   - Retry button (if failed)
+
+5. TransferCreateModal
+   Props: selectedDCP or null, onClose, onSuccess
+   Form:
+   - DCP selector (if not pre-selected)
+   - Destination options:
+     * Single server dropdown
+     * Multiple servers (checkboxes)
+     * "All sites" toggle
+   - Priority slider with labels (Low 1-3, Medium 4-6, High 7-10)
+   - Notes field
+   - Summary:
+     * Total transfers to create
+     * Total size to transfer
+     * Available seeders
+   - Submit/Cancel buttons
+
+6. GlobalSearch
+   Props: onSelect callback
+   Features:
+   - Debounced search (500ms)
+   - Searches DCP names and content titles
+   - Dropdown results (max 10)
+   - Keyboard navigation (arrow keys, enter to select)
+   - Shows DCP size and kind in results
+   - Click result → navigate to DCP details
+
+===========================================
+ADVANCED REQUIREMENTS
+===========================================
+
+ERROR HANDLING:
+- Network errors: Retry button with exponential backoff
+- API errors: Display error.message from API
+- Validation errors: Inline field errors
+- Global error boundary for crash recovery
+
+PERFORMANCE:
+- Virtualized tables for 1000+ rows (react-window or tanstack-table)
+- Lazy loading for detail views
+- Image/icon optimization
+- Code splitting by route
+- Memoization for expensive computations
+
+ACCESSIBILITY:
+- ARIA labels for all interactive elements
+- Keyboard navigation support
+- Screen reader friendly
+- Color contrast WCAG AA compliant
+- Focus indicators
+
+STATE MANAGEMENT:
+- API data: React Query with caching
+- Global state: Selected server filter, theme preference, user preferences
+- Form state: React Hook Form for complex forms
+- URL state: Filters and pagination in URL params
+
+REAL-TIME FEATURES:
+- Auto-refresh active transfers every 5 seconds
+- Visual indicators when data is stale
+- "Last updated X seconds ago" timestamp
+- Pause/resume auto-refresh toggle
+
+===========================================
+FILE STRUCTURE
+===========================================
+
+omnicloud-frontend/
+├── src/
+│   ├── api/
+│   │   ├── client.ts          # Axios instance with base URL
+│   │   ├── servers.ts         # Server API calls
+│   │   ├── dcps.ts            # DCP API calls
+│   │   ├── torrents.ts        # Torrent API calls
+│   │   ├── transfers.ts       # Transfer API calls
+│   │   └── types.ts           # API response types
+│   ├── components/
+│   │   ├── Layout/
+│   │   │   ├── Sidebar.tsx
+│   │   │   ├── TopBar.tsx
+│   │   │   └── Layout.tsx
+│   │   ├── Dashboard/
+│   │   │   ├── StatsCard.tsx
+│   │   │   ├── RecentActivity.tsx
+│   │   │   └── ActiveTransfers.tsx
+│   │   ├── DCPs/
+│   │   │   ├── DCPTable.tsx
+│   │   │   ├── DCPDetailModal.tsx
+│   │   │   ├── DCPFilters.tsx
+│   │   │   └── BulkTransferModal.tsx
+│   │   ├── Servers/
+│   │   │   ├── ServerCard.tsx
+│   │   │   ├── ServerGrid.tsx
+│   │   │   └── AddServerModal.tsx
+│   │   ├── Transfers/
+│   │   │   ├── TransferProgressCard.tsx
+│   │   │   ├── TransferTable.tsx
+│   │   │   ├── TransferCreateModal.tsx
+│   │   │   └── TransferFilters.tsx
+│   │   ├── Torrents/
+│   │   │   ├── TorrentTable.tsx
+│   │   │   ├── TorrentQueueList.tsx
+│   │   │   └── SeedersList.tsx
+│   │   └── common/
+│   │       ├── Button.tsx
+│   │       ├── Badge.tsx
+│   │       ├── ProgressBar.tsx
+│   │       ├── StatusIndicator.tsx
+│   │       ├── SearchBar.tsx
+│   │       └── DataTable.tsx
+│   ├── pages/
+│   │   ├── Dashboard.tsx
+│   │   ├── DCPLibrary.tsx
+│   │   ├── Servers.tsx
+│   │   ├── Transfers.tsx
+│   │   ├── Torrents.tsx
+│   │   └── Analytics.tsx
+│   ├── hooks/
+│   │   ├── useServers.ts      # React Query hook
+│   │   ├── useDCPs.ts
+│   │   ├── useTorrents.ts
+│   │   ├── useTransfers.ts
+│   │   └── usePolling.ts      # Auto-refresh hook
+│   ├── utils/
+│   │   ├── format.ts          # Formatting utilities
+│   │   ├── constants.ts       # API URL, refresh intervals
+│   │   └── validation.ts      # Form validation
+│   ├── store/
+│   │   └── appStore.ts        # Zustand store for global state
+│   ├── App.tsx
+│   └── main.tsx
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+├── tailwind.config.js
+└── README.md
+
+===========================================
+CONFIGURATION
+===========================================
+
+API_BASE_URL: http://localhost:10858/api/v1
+TRACKER_URL: http://localhost:10859/announce
+
+Refresh Intervals (milliseconds):
+- ACTIVE_TRANSFERS_POLL: 5000
+- TORRENT_QUEUE_POLL: 10000
+- SERVERS_POLL: 30000
+- DCPS_POLL: 60000
+- TORRENT_LIST_POLL: 60000
+
+===========================================
+SAMPLE API INTEGRATION CODE
+===========================================
+
+// api/client.ts
+import axios from 'axios';
+
+export const apiClient = axios.create({
+  baseURL: 'http://localhost:10858/api/v1',
+  timeout: 30000,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// api/transfers.ts
+import { apiClient } from './client';
+import { Transfer } from './types';
+
+export const transfersApi = {
+  getAll: (params?: { server_id?: string; status?: string }) =>
+    apiClient.get<Transfer[]>('/transfers', { params }),
+  
+  getById: (id: string) =>
+    apiClient.get<Transfer>(`/transfers/${id}`),
+  
+  create: (data: {
+    torrent_id: string;
+    destination_server_id: string;
+    requested_by: string;
+    priority?: number;
+  }) =>
+    apiClient.post<{ id: string; message: string }>('/transfers', data),
+  
+  update: (id: string, data: Partial<Transfer>) =>
+    apiClient.put(`/transfers/${id}`, data),
+  
+  cancel: (id: string) =>
+    apiClient.delete(`/transfers/${id}`),
+};
+
+// hooks/useTransfers.ts
+import { useQuery } from '@tanstack/react-query';
+import { transfersApi } from '../api/transfers';
+
+export const useActiveTransfers = () => {
+  return useQuery({
+    queryKey: ['transfers', 'active'],
+    queryFn: () => transfersApi.getAll({ 
+      status: 'downloading,queued' 
+    }).then(r => r.data),
+    refetchInterval: 5000, // 5 seconds
+  });
+};
+
+===========================================
+PRIORITY FEATURES (Build These First)
+===========================================
+
+MVP (Minimum Viable Product) - Build in this order:
+1. Basic layout with sidebar navigation
+2. Dashboard with stats cards and health indicator
+3. DCP Library page with table (search, sort, basic filters)
+4. Servers page (list view with status indicators)
+5. Transfer Create Modal (single DCP to single server)
+6. Transfers page (active transfers with progress)
+7. API integration with React Query
+8. Real-time polling for active transfers
+
+Enhanced Features (Add After MVP):
+1. Torrent page with queue and seeding status
+2. Bulk transfer functionality
+3. Advanced filters and saved presets
+4. Analytics page with charts
+5. Dark/light theme toggle
+6. Export to CSV
+7. Multi-server transfer (one DCP to many servers)
+8. Transfer history with detailed logs
+
+===========================================
+TESTING REQUIREMENTS
+===========================================
+
+- Unit tests for utility functions
+- Component tests for major components
+- Integration tests for API calls (mock responses)
+- E2E tests for critical flows:
+  * Create transfer
+  * View DCP details
+  * Register server
+
+===========================================
+DELIVERABLES
+===========================================
+
+1. Complete React application source code
+2. package.json with all dependencies
+3. README.md with:
+   - Setup instructions
+   - Environment variables
+   - Available scripts
+   - API configuration
+   - Development guide
+4. Sample .env file with API_BASE_URL
+5. Build script for production deployment
+
+===========================================
+DESIGN REFERENCES
+===========================================
+
+Style inspiration:
+- qBittorrent Web UI (for torrent management)
+- Sonarr/Radarr (for media management grids)
+- Vercel Dashboard (for modern, clean aesthetic)
+- Linear (for smooth interactions and polish)
+
+Design principles:
+- Information density without clutter
+- Fast scanning (use color, icons, badges effectively)
+- Progressive disclosure (hide complexity until needed)
+- Keyboard shortcuts for power users
+- Instant feedback for all actions
+
+===========================================
+SPECIAL CONSIDERATIONS
+===========================================
+
+1. LARGE DATASETS:
+   - The production system has 386+ DCPs (could grow to thousands)
+   - Use virtualization for tables
+   - Implement pagination or infinite scroll
+   - Server-side search if API supports it (or filter client-side)
+
+2. LONG-RUNNING OPERATIONS:
+   - Transfers can take hours/days for large DCPs
+   - Show persistent progress (not just during session)
+   - Email/webhook notifications for completion (future)
+   - History tracking
+
+3. MULTI-SITE COORDINATION:
+   - Clear visual distinction between "this server" and "all servers"
+   - Show which server the user is managing (if client mode)
+   - Handle main server vs client UI differences gracefully
+
+4. CINEMA OPERATOR USERS:
+   - May not be highly technical
+   - Clear labels and descriptions
+   - Confirm destructive actions
+   - Helpful error messages with next steps
+   - Tooltips for technical terms (info hash, seeder, piece size)
+
+===========================================
+EXAMPLE USER FLOWS
+===========================================
+
+FLOW 1: Transfer DCP from Main to Site A
+1. User logs into OmniCloud dashboard
+2. Navigates to DCP Library
+3. Searches for "Shawshank Redemption"
+4. Clicks "Transfer" button on the DCP row
+5. Modal opens:
+   - Shows: "Shawshank Redemption (42 GB, 6 seeders available)"
+   - Selects destination: "Cinema Alpha - London"
+   - Sets priority: 5 (medium)
+   - Enters note: "Requested for Friday screening"
+   - Clicks "Initiate Transfer"
+6. Success toast: "Transfer created (ID: abc123)"
+7. Redirected to Transfers page
+8. Sees new transfer in "Queued" status
+9. Within seconds, status changes to "Downloading"
+10. Watches progress bar fill, speed shown as "12 MB/s"
+11. ETA updates: "2h 15m remaining"
+12. After 2 hours, status changes to "Completed" with green checkmark
+
+FLOW 2: View All DCPs at a Specific Site
+1. User on Dashboard
+2. Clicks server dropdown in top bar
+3. Selects "Cinema Beta - Manchester"
+4. Dashboard stats update to show only Beta's inventory
+5. Navigates to DCP Library
+6. Table shows only DCPs that Cinema Beta has
+7. Can initiate transfers FROM Beta to other sites
+8. Can clear filter to see global inventory again
+
+FLOW 3: Bulk Transfer to All Sites
+1. User in DCP Library
+2. Selects 5 new trailers (checkboxes)
+3. Clicks "Bulk Transfer" button in toolbar
+4. Modal shows: "Transfer 5 DCPs (total 8.5 GB)"
+5. Checks "All authorized sites" option (shows 4 sites)
+6. Sets priority to 7 (high)
+7. Clicks "Create Transfers"
+8. Success: "Created 20 transfers (5 DCPs × 4 sites)"
+9. All 20 transfers appear in Transfers page
+10. Can monitor progress of all simultaneously
+
+FLOW 4: Monitor Torrent Generation
+1. New DCP is added to archive (scanner detects it)
+2. User navigates to Torrents page
+3. Sees "Queue" tab shows:
+   - "Avatar_4K_DCP" - Status: Queued
+4. After 10 seconds, status changes to "Generating" with progress bar
+5. Progress shows: "48% - Hashing video_track.mxf"
+6. After 5 minutes: Status "Completed"
+7. New torrent appears in "Registry" tab
+8. Torrent shows: Info hash, 1 seeder (this server), 32 MB piece size
+
+===========================================
+NOTES FOR THE LLM DEVELOPER
+===========================================
+
+- This is a real production system managing 22TB+ of cinema content
+- The backend is already built and running on localhost:10858
+- Focus on polish and usability - cinema operators need reliable tools
+- Prioritize performance (large datasets, real-time updates)
+- Build the MVP first, then enhance iteratively
+- Use modern React patterns (hooks, functional components)
+- TypeScript strict mode for type safety
+- Follow React best practices (component composition, separation of concerns)
+- Make it visually appealing - dark theme, smooth animations, professional look
+- Test with the real API (it's running and has data)
+- Add loading skeletons to avoid layout shift
+- Handle edge cases (no DCPs, no servers, all transfers completed)
+- Mobile responsive is important (operators may check from tablets)
+
+DELIVERABLE:
+Create a production-ready React frontend that cinema operators will use daily to manage their DCP distribution network. It should be intuitive, fast, reliable, and visually modern. This is the control panel for a 22TB+ content distribution network serving multiple cinema sites.
+
+===========================================
+CONNECTION INFORMATION
+===========================================
+
+Backend API Endpoint: http://localhost:10858/api/v1
+BitTorrent Tracker: http://localhost:10859/announce
+Database: PostgreSQL (not directly accessed by frontend)
+
+Test the frontend against the running backend using curl or fetch to verify API integration:
+curl http://localhost:10858/api/v1/health
+curl http://localhost:10858/api/v1/dcps
+curl http://localhost:10858/api/v1/servers
+curl http://localhost:10858/api/v1/torrents
+curl http://localhost:10858/api/v1/transfers
+
+Current Production Status:
+- 386 DCP packages indexed
+- Main server running with full torrent support
+- Real-time scanner monitoring /APPBOX_DATA/storage/DCP/Archive
+- Torrent generation queue active
+- BitTorrent tracker operational
+
+===========================================

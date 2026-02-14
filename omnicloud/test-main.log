@@ -1,0 +1,63 @@
+2026/02/13 21:31:15 Logging to /home/appbox/DCPCLOUDAPP/omnicloud/test-main.log
+2026/02/13 21:31:15 Configuration loaded:
+2026/02/13 21:31:15   Database: omni@localhost:5432/OmniCloud
+2026/02/13 21:31:15   Scan Path: /home/appbox/DCPCLOUDAPP/test_dcp
+2026/02/13 21:31:15   API Port: 18058
+2026/02/13 21:31:15   Scan Interval: 12 hours
+2026/02/13 21:31:15   Server Mode: main
+2026/02/13 21:31:15   Tracker Port: 18059
+2026/02/13 21:31:15   Torrent Data Dir: /home/appbox/DCPCLOUDAPP/test_downloads
+2026/02/13 21:31:15 Successfully connected to database
+2026/02/13 21:31:15 Database connected successfully
+2026/02/13 21:31:15 Running database migrations...
+2026/02/13 21:31:15   Running migration: 001_create_servers.sql
+2026/02/13 21:31:15   Warning: 001_create_servers.sql: pq: trigger "update_servers_updated_at" for relation "servers" already exists
+2026/02/13 21:31:15   Running migration: 002_create_dcp_packages.sql
+2026/02/13 21:31:15   Warning: 002_create_dcp_packages.sql: pq: trigger "update_dcp_packages_updated_at" for relation "dcp_packages" already exists
+2026/02/13 21:31:15   Running migration: 003_create_dcp_compositions.sql
+2026/02/13 21:31:15   Warning: 003_create_dcp_compositions.sql: pq: trigger "update_dcp_compositions_updated_at" for relation "dcp_compositions" already exists
+2026/02/13 21:31:15   Running migration: 004_create_dcp_assets.sql
+2026/02/13 21:31:15   ✓ 004_create_dcp_assets.sql completed
+2026/02/13 21:31:15   Running migration: 005_create_inventory.sql
+2026/02/13 21:31:15   Warning: 005_create_inventory.sql: pq: trigger "update_server_dcp_inventory_updated_at" for relation "server_dcp_inventory" already exists
+2026/02/13 21:31:15   Running migration: 006_add_mac_address.sql
+2026/02/13 21:31:15   ✓ 006_add_mac_address.sql completed
+2026/02/13 21:31:15   Running migration: 007_create_torrent_tables.sql
+2026/02/13 21:31:15   Warning: 007_create_torrent_tables.sql: pq: trigger "update_torrent_seeders_updated_at" for relation "torrent_seeders" already exists
+2026/02/13 21:31:15 Migrations complete
+2026/02/13 21:31:15 Updated existing server: dcp1.omniplex.services
+2026/02/13 21:31:15 Server registered with ID: 9adb0200-7b1d-47da-8c85-2d1e04eae0e1
+2026/02/13 21:31:15 Torrent client initialized
+2026/02/13 21:31:15 Torrent queue manager started
+2026/02/13 21:31:15 BitTorrent tracker started on port 18059
+2026/02/13 21:31:15 Filesystem watcher started for: /home/appbox/DCPCLOUDAPP/test_dcp
+2026/02/13 21:31:15 Periodic scanner started (interval: 12h0m0s)
+2026/02/13 21:31:15 Starting torrent queue manager...
+2026/02/13 21:31:15 Starting scan worker...
+2026/02/13 21:31:15 Starting full scan of: /home/appbox/DCPCLOUDAPP/test_dcp
+2026/02/13 21:31:15 API routes configured
+2026/02/13 21:31:15 OmniCloud is running
+2026/02/13 21:31:15 Press Ctrl+C to stop
+2026/02/13 21:31:15 Starting API server on :18058
+2026/02/13 21:31:15 Discovering DCP packages in: /home/appbox/DCPCLOUDAPP/test_dcp
+2026/02/13 21:31:15 Found DCP package: /home/appbox/DCPCLOUDAPP/test_dcp/TESTPKG1
+2026/02/13 21:31:15 Discovery complete: found 1 DCP packages
+2026/02/13 21:31:15 Discovered 1 DCP packages
+2026/02/13 21:31:15 Scanning package 1/1: /home/appbox/DCPCLOUDAPP/test_dcp/TESTPKG1
+2026/02/13 21:31:15 Scanning package: /home/appbox/DCPCLOUDAPP/test_dcp/TESTPKG1
+2026/02/13 21:31:15 Package scan complete: TESTPKG1 (Size: 3212 bytes, Files: 4, CPLs: 1, PKLs: 1)
+2026/02/13 21:31:15 Indexing package: TESTPKG1
+2026/02/13 21:31:15 Torrent already exists for package 176115ea-2298-4b01-a33b-4194630137b8
+2026/02/13 21:31:15 Successfully indexed package: TESTPKG1
+2026/02/13 21:31:15 Full scan complete: 1 packages found, 0 added, 1 updated, 0 errors (took 15.710376ms)
+2026/02/13 21:31:21 GET /api/v1/health 200 298.011µs
+2026/02/13 21:31:24 GET /api/v1/torrents 200 1.073933ms
+2026/02/13 21:31:28 GET /api/v1/torrents/d14e6e9dcf666a811cebbb7d3ba510700583cd82/file 200 422.382µs
+2026/02/13 21:33:01 GET /api/v1/health 200 193.531µs
+2026/02/13 21:33:28 Shutdown signal received, stopping OmniCloud...
+2026/02/13 21:33:28 Scan worker stopped
+2026/02/13 21:33:28 Shutting down API server...
+2026/02/13 21:33:28 OmniCloud stopped
+2026/02/13 21:33:28 Periodic scanner stopped
+2026/02/13 21:33:28 API server error: http: Server closed
+2026/02/13 21:33:28 Filesystem watcher stopped

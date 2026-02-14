@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CompositionPlaylist>
+  <Id>urn:uuid:33333333-3333-3333-3333-333333333333</Id>
+  <AnnotationText>OmniCloud Test CPL</AnnotationText>
+  <IssueDate>2026-02-13T00:00:00Z</IssueDate>
+  <Issuer>OmniCloud</Issuer>
+  <Creator>OmniCloud Test</Creator>
+  <ContentTitleText>OmniCloud Test Content</ContentTitleText>
+  <ContentKind>feature</ContentKind>
+  <ContentVersion>
+    <Id>urn:uuid:66666666-6666-6666-6666-666666666666</Id>
+    <LabelText>TEST</LabelText>
+  </ContentVersion>
+  <ReelList>
+    <Reel>
+      <Id>urn:uuid:55555555-5555-5555-5555-555555555555</Id>
+      <AssetList>
+        <MainPicture>
+          <Id>urn:uuid:44444444-4444-4444-4444-444444444444</Id>
+          <EditRate>24 1</EditRate>
+          <IntrinsicDuration>24</IntrinsicDuration>
+          <EntryPoint>0</EntryPoint>
+          <Duration>24</Duration>
+          <KeyId></KeyId>
+          <Hash></Hash>
+          <FrameRate>24 1</FrameRate>
+          <ScreenAspectRatio>1998 1080</ScreenAspectRatio>
+        </MainPicture>
+      </AssetList>
+    </Reel>
+  </ReelList>
+</CompositionPlaylist>
