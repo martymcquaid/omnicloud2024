@@ -1,3 +1,8 @@
+# Local config (never overwrite with git pull)
+auth.config
+omnicloud.config
+omnicloud/auth.config
+
 # Runtime / local
 omnicloud/omnicloud.log
 omnicloud/omnicloud.pid
