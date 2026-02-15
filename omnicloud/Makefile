@@ -1,10 +1,15 @@
 .PHONY: build run install migrate test clean release
 
+# Ensure go is on PATH when make runs (e.g. non-interactive shell without profile)
+# Order: GOROOT (if set), common install paths, then existing PATH
+export PATH := $(GOROOT)/bin:/usr/local/go/bin:/usr/lib/go/bin:/snap/bin:$(PATH)
+
 # Version can be overridden: make build VERSION=1.0.0
 VERSION ?= $(shell date -u +%Y%m%d-%H%M%S)
 LDFLAGS := -ldflags "-X main.Version=$(VERSION)"
 
 build:
+	@command -v go >/dev/null 2>&1 || (echo "ERROR: 'go' not found. Install Go (e.g. sudo snap install go) or add GOROOT/bin to PATH."; exit 1)
 	@echo "Building OmniCloud v$(VERSION)..."
 	@mkdir -p bin
 	go build $(LDFLAGS) -o bin/omnicloud cmd/omnicloud/main.go

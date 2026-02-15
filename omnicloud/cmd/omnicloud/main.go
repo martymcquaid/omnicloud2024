@@ -327,6 +327,8 @@ func runMigrations(database *db.DB) error {
 		"008_add_torrent_queue_total_size.sql",
 		"009_torrent_queue_total_size_bigint.sql",
 		"010_add_software_versions.sql",
+		"011_add_queue_sync_fields.sql",
+		"012_add_metadata_sync_constraints.sql",
 	}
 
 	for _, migration := range migrations {
