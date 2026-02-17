@@ -1,6 +1,28 @@
 {
-  "latest_version": "20260217-003248",
+  "latest_version": "20260217-004204",
   "versions": [
+    {
+      "version": "20260217-004204",
+      "build_time": "2026-02-17T00:42:04Z",
+      "checksum": "427148cfdb21fd87841f402013e15bd6833a7edb5cddbfb48407ee368e2e2bf9",
+      "size_bytes": 11221967,
+      "download_url": "/releases/omnicloud-20260217-004204-linux-amd64.tar.gz",
+      "is_stable": true,
+      "features": [
+        "Fixed transfer history showing correct package sizes (from torrent metadata)",
+        "History table now has expandable rows with full error details",
+        "Failed transfers show error message, retry button, and download progress",
+        "Cancelled transfers show how much data was downloaded before cancellation"
+      ]
+    },
+    {
+      "version": "20260217-003410",
+      "build_time": "2026-02-17T00:34:10Z",
+      "checksum": "d9e6d84db8c91f2549908dc7da187a95fcfe03808f1794dee8bc36790bdba8e0",
+      "size_bytes": 11221967,
+      "download_url": "/releases/omnicloud-20260217-003410-linux-amd64.tar.gz",
+      "is_stable": true
+    },
     {
       "version": "20260217-003248",
       "release_date": "2026-02-17T00:32:48Z",
@@ -13,5 +35,13 @@
       "download_url": "https://github.com/martymcquaid/omnicloud2024/releases/download/20260217-003248/omnicloud-20260217-003248-linux-amd64.tar.gz",
       "notes": "Frontend fix: Display total package size in transfer views instead of downloaded bytes"
     }
-  ]
+  ],
+  "latest": {
+    "version": "20260217-004204",
+    "build_time": "2026-02-17T00:42:04Z",
+    "checksum": "427148cfdb21fd87841f402013e15bd6833a7edb5cddbfb48407ee368e2e2bf9",
+    "size_bytes": 11221967,
+    "download_url": "/releases/omnicloud-20260217-004204-linux-amd64.tar.gz",
+    "is_stable": true
+  }
 }
