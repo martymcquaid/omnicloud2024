@@ -9,3 +9,15 @@ omnicloud/omnicloud.pid
 omnicloud/data/
 *.log
 *.pid
+
+# Cursor / IDE (do not commit logs; .cursor/rules/ may be committed)
+.cursor/debug.log
+.cursor/*.log
+
+# Local DBs and caches (do not commit)
+*.bolt.db
+omnicloud-client/data/
+test_dcp/
+test_downloads/
+omnicloud/*.db
+omnicloud/omnicloud.db
