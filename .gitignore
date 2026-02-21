@@ -21,3 +21,14 @@ test_dcp/
 test_downloads/
 omnicloud/*.db
 omnicloud/omnicloud.db
+
+# Omnicinema-hub frontend (do not commit deps/build/local)
+omnicinema-hub/node_modules
+omnicinema-hub/dist
+omnicinema-hub/.env
+omnicinema-hub/.vite
+omnicinema-hub/backend/bin
+omnicinema-hub/backend/*.pid
+omnicinema-hub/backend/*.log
+omnicinema-hub/backend/auth.config
+omnicinema-hub/bun.lockb

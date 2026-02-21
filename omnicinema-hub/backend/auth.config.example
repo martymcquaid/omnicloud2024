@@ -1,0 +1,33 @@
+# OmniCloud Configuration Example
+# Copy to auth.config in this directory and set your values.
+# Do not commit auth.config (it contains secrets).
+
+# Database connection
+host=localhost
+port=5432
+database=OmniCloud
+user=omni
+password=YOUR_PASSWORD_HERE
+
+# Server configuration
+server_mode=main
+api_port=10858
+scan_path=/path/to/your/DCP/Archive
+registration_key=your-secure-registration-key
+scan_interval=12
+# Optional: run full scan every N minutes to discover new DCPs (e.g. 15 = every 15 min). If set, overrides scan_interval for schedule.
+# scan_interval_minutes=15
+server_name=dcp1.example.com
+server_location=Local
+
+# Torrent configuration
+tracker_port=10851
+torrent_data_dir=/path/to/DCP/Downloads
+max_upload_rate=0
+max_download_rate=0
+max_concurrent_seeds=2
+max_concurrent_downloads=5
+piece_hash_workers=4
+
+# Client mode only: main server URL
+# main_server_url=http://main-server:10858
