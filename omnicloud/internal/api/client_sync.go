@@ -74,7 +74,8 @@ type DCPMetadataUpdate struct {
 // ClientSync handles synchronization from client to main server
 type ClientSync struct {
 	database        *db.DB
-	serverID        uuid.UUID
+	localServerID   uuid.UUID // ID in the local database (for local DB queries)
+	serverID        uuid.UUID // ID on the main server (for API calls) - updated after registration
 	mainServerURL   string
 	macAddress      string
 	registrationKey string
@@ -94,7 +95,8 @@ func NewClientSync(database *db.DB, serverID uuid.UUID, mainServerURL, serverNam
 
 	return &ClientSync{
 		database:        database,
-		serverID:        serverID,
+		localServerID:   serverID,
+		serverID:        serverID, // will be updated to remote ID after registration
 		mainServerURL:   mainServerURL,
 		macAddress:      macAddress,
 		registrationKey: registrationKey,
@@ -106,12 +108,16 @@ func NewClientSync(database *db.DB, serverID uuid.UUID, mainServerURL, serverNam
 	}, nil
 }
 
-// Start begins periodic synchronization with main server
+// Start begins periodic synchronization with main server.
+// Note: RegisterWithMainServer() should be called before Start() to get the correct remote server ID.
 func (cs *ClientSync) Start() {
 	log.Printf("Client sync service started (Main Server: %s)", cs.mainServerURL)
 
-	// Register with main server immediately
-	go cs.registerWithMainServer()
+	// Run first sync immediately so packages exist on main server before queue status is reported
+	go func() {
+		cs.syncInventory()
+		cs.syncDCPMetadata()
+	}()
 
 	// Start periodic sync (every 5 minutes)
 	go cs.periodicSync()
@@ -121,6 +127,23 @@ func (cs *ClientSync) Start() {
 func (cs *ClientSync) Stop() {
 	close(cs.stopChan)
 	log.Println("Client sync service stopped")
+}
+
+// MACAddress returns the MAC address used for authentication
+func (cs *ClientSync) MACAddress() string {
+	return cs.macAddress
+}
+
+// ServerID returns the current server ID (may be updated after registration)
+func (cs *ClientSync) ServerID() uuid.UUID {
+	return cs.serverID
+}
+
+// RegisterWithMainServer registers this client synchronously and returns the main server's ID.
+// This must be called before creating the update agent and reporter so they use the correct ID.
+func (cs *ClientSync) RegisterWithMainServer() (uuid.UUID, error) {
+	cs.registerWithMainServer()
+	return cs.serverID, nil
 }
 
 // registerWithMainServer registers this client with the main server
@@ -237,7 +260,7 @@ func (cs *ClientSync) syncInventory() {
 		WHERE i.server_id = $1
 		ORDER BY p.package_name`
 
-	rows, err := cs.database.Query(query, cs.serverID)
+	rows, err := cs.database.Query(query, cs.localServerID)
 	if err != nil {
 		log.Printf("Error querying inventory: %v", err)
 		return
@@ -262,9 +285,11 @@ func (cs *ClientSync) syncInventory() {
 	}
 
 	if len(packages) == 0 {
-		log.Println("No packages to sync")
+		log.Println("[inventory-sync] No packages to sync")
 		return
 	}
+
+	log.Printf("[inventory-sync] Syncing %d packages with main server", len(packages))
 
 	// Send to main server
 	update := InventoryUpdate{
@@ -308,14 +333,14 @@ func (cs *ClientSync) syncInventory() {
 		return
 	}
 
-	log.Printf("Successfully synced %d packages with main server", len(packages))
+	log.Printf("[inventory-sync] Successfully synced %d packages with main server", len(packages))
 }
 
 // syncDCPMetadata sends complete DCP metadata (packages, compositions, assets) to main server
 func (cs *ClientSync) syncDCPMetadata() {
 	log.Println("Syncing DCP metadata with main server...")
 
-	// Get all packages with full metadata
+	// Get all packages with full metadata (no limit - sync everything)
 	query := `
 		SELECT p.id, p.assetmap_uuid, p.package_name, p.content_title, p.content_kind,
 		       p.issue_date, p.issuer, p.creator, p.annotation_text, p.volume_count,
@@ -324,10 +349,9 @@ func (cs *ClientSync) syncDCPMetadata() {
 		JOIN server_dcp_inventory i ON p.id = i.package_id
 		WHERE i.server_id = $1
 		ORDER BY p.discovered_at DESC
-		LIMIT 100
 	`
 
-	rows, err := cs.database.Query(query, cs.serverID)
+	rows, err := cs.database.Query(query, cs.localServerID)
 	if err != nil {
 		log.Printf("Error querying DCP metadata: %v", err)
 		return
@@ -366,12 +390,15 @@ func (cs *ClientSync) syncDCPMetadata() {
 	}
 
 	if len(packages) == 0 {
-		log.Println("No DCP metadata to sync")
+		log.Println("[metadata-sync] No DCP metadata to sync")
 		return
 	}
 
+	log.Printf("[metadata-sync] Found %d packages to sync with main server", len(packages))
+
 	// Send to main server in batches
-	batchSize := 10
+	batchSize := 50
+	successCount := 0
 	for i := 0; i < len(packages); i += batchSize {
 		end := i + batchSize
 		if end > len(packages) {
@@ -380,14 +407,18 @@ func (cs *ClientSync) syncDCPMetadata() {
 
 		batch := packages[i:end]
 		if err := cs.sendDCPMetadataBatch(batch); err != nil {
-			log.Printf("Error sending DCP metadata batch: %v", err)
+			log.Printf("[metadata-sync] Error sending batch %d/%d (%d packages): %v", (i/batchSize)+1, (len(packages)+batchSize-1)/batchSize, len(batch), err)
 			continue
 		}
 
-		log.Printf("Synced metadata for %d packages (batch %d/%d)", len(batch), (i/batchSize)+1, (len(packages)+batchSize-1)/batchSize)
+		successCount += len(batch)
+		// Only log every 5th batch to avoid log spam
+		if (i/batchSize)%5 == 0 || end >= len(packages) {
+			log.Printf("[metadata-sync] Progress: %d/%d packages synced (batch %d/%d)", successCount, len(packages), (i/batchSize)+1, (len(packages)+batchSize-1)/batchSize)
+		}
 	}
 
-	log.Printf("Successfully synced metadata for %d packages", len(packages))
+	log.Printf("[metadata-sync] Sync complete: %d/%d packages sent to main server", successCount, len(packages))
 }
 
 // getCompositionsForPackage retrieves compositions (CPLs) for a package
@@ -528,7 +559,7 @@ func (cs *ClientSync) sendHeartbeat() {
 		    software_version = $2,
 		    last_seen = $3
 		WHERE id = $4
-	`, storageCapacityTB, cs.softwareVersion, time.Now(), cs.serverID)
+	`, storageCapacityTB, cs.softwareVersion, time.Now(), cs.localServerID)
 	if err != nil {
 		log.Printf("Error updating local server record: %v", err)
 	}

@@ -7,25 +7,32 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/omnicloud/omnicloud/internal/api"
 	"github.com/omnicloud/omnicloud/internal/db"
 	"github.com/omnicloud/omnicloud/internal/parser"
-	torrentpkg "github.com/omnicloud/omnicloud/internal/torrent"
 )
 
 // TorrentQueue interface for adding packages to torrent queue
 type TorrentQueue interface {
 	AddToQueue(packageID string) error
+	// ShouldHash asks the orchestrator (main server) whether this server should hash
+	// the given package. Returns true if we should hash, false if another server is
+	// already handling it (or the torrent already exists).
+	ShouldHash(assetMapUUID string) bool
+	// StartSeedingExisting starts co-seeding a canonical torrent for a deduplicated DCP.
+	// mxfPath is the library directory with the large MXF files; xmlShadowPath is the
+	// directory holding the canonical XML files fetched from the main server.
+	// The torrent storage will read each file from whichever path it exists in.
+	StartSeedingExisting(torrentBytes []byte, mxfPath, xmlShadowPath, packageID, torrentID string) error
 }
 
 // Indexer handles storing DCP metadata to the database
 type Indexer struct {
-	db               *db.DB
-	serverID         uuid.UUID
-	torrentQueue     TorrentQueue
-	torrentDownloader *torrentpkg.TorrentDownloader
-	isClientMode     bool
-	mainServerURL    string
-	macAddress       string
+	db             *db.DB
+	serverID       uuid.UUID
+	torrentQueue   TorrentQueue
+	settingsClient *api.SettingsClient // nil on main server; set on client servers
+	shadowXMLBase  string              // base dir for canonical XML shadow copies (e.g. /var/omnicloud/canonical-xml)
 }
 
 // NewIndexer creates a new indexer instance
@@ -34,21 +41,25 @@ func NewIndexer(database *db.DB, serverID uuid.UUID) *Indexer {
 		db:           database,
 		serverID:     serverID,
 		torrentQueue: nil, // Set later with SetTorrentQueue
-		isClientMode: false,
 	}
-}
-
-// SetClientMode configures the indexer for client mode with torrent downloading
-func (idx *Indexer) SetClientMode(mainServerURL, macAddress string) {
-	idx.isClientMode = true
-	idx.mainServerURL = mainServerURL
-	idx.macAddress = macAddress
-	idx.torrentDownloader = torrentpkg.NewTorrentDownloader(idx.db.DB, mainServerURL, idx.serverID.String(), macAddress)
 }
 
 // SetTorrentQueue sets the torrent queue manager
 func (idx *Indexer) SetTorrentQueue(queue TorrentQueue) {
 	idx.torrentQueue = queue
+}
+
+// SetSettingsClient provides the client used to fetch canonical XML from the main server.
+// Only call this on client servers (not main server).
+func (idx *Indexer) SetSettingsClient(sc *api.SettingsClient) {
+	idx.settingsClient = sc
+}
+
+// SetShadowXMLBase sets the directory where canonical XML shadow copies are stored.
+// These are kept separate from the RosettaBridge library to avoid disrupting its operation.
+// Example: /var/omnicloud/canonical-xml
+func (idx *Indexer) SetShadowXMLBase(dir string) {
+	idx.shadowXMLBase = dir
 }
 
 // IndexPackage stores all package metadata to the database
@@ -68,7 +79,30 @@ func (idx *Indexer) IndexPackage(info *DCPPackageInfo) error {
 	if err != nil {
 		return fmt.Errorf("invalid ASSETMAP UUID: %w", err)
 	}
-	
+
+	// --- Cross-site deduplication via CPL UUID ---
+	// RosettaBridge delivers the same DCP to each cinema with a fresh ASSETMAP UUID but
+	// an identical CPL UUID and identical MXF file hashes. Detect this and, instead of
+	// creating a new package + torrent, link this server's inventory to the existing
+	// canonical package and begin co-seeding its torrent (after replacing local XML files
+	// with the canonical ones so piece hashes align exactly).
+	if len(info.CPLs) > 0 && idx.settingsClient != nil {
+		cplUUIDStr := parser.ExtractUUID(info.CPLs[0].ID)
+		if cplUUIDStr != "" {
+			cplUUID, parseErr := uuid.Parse(cplUUIDStr)
+			if parseErr == nil {
+				if handled, handleErr := idx.handleDuplicateByCPL(info, cplUUID, assetMapUUID); handled {
+					if handleErr != nil {
+						log.Printf("[dedup] CPL-based dedup for %s failed: %v — falling through to normal indexing", info.PackageName, handleErr)
+					} else {
+						log.Printf("[dedup] %s recognised as duplicate via CPL %s — linked to canonical package", info.PackageName, cplUUID)
+						return nil
+					}
+				}
+			}
+		}
+	}
+
 	// Get content title from first CPL if available
 	contentTitle := ""
 	contentKind := ""
@@ -76,7 +110,7 @@ func (idx *Indexer) IndexPackage(info *DCPPackageInfo) error {
 		contentTitle = info.CPLs[0].ContentTitleText
 		contentKind = info.CPLs[0].ContentKind
 	}
-	
+
 	// Create or update DCP package record
 	now := time.Now()
 	pkg := &db.DCPPackage{
@@ -155,6 +189,108 @@ func (idx *Indexer) IndexPackage(info *DCPPackageInfo) error {
 	return nil
 }
 
+// handleDuplicateByCPL checks whether the given CPL UUID is already in the system under a
+// different ASSETMAP UUID (i.e. the same film delivered to multiple sites by RosettaBridge).
+// If a match is found AND the canonical torrent already exists, it:
+//  1. Links this server's inventory to the existing canonical package row
+//  2. Fetches the canonical XML files (ASSETMAP, PKL, VOLINDEX, etc.) from the main server
+//  3. Overwrites the local XML files so the byte layout matches the canonical torrent exactly
+//  4. Starts seeding the canonical torrent from this server's local path
+//
+// Returns (true, nil) if the duplicate was handled successfully — caller should return nil.
+// Returns (true, err) if we found a duplicate but something failed — caller should fall through
+// to normal indexing so the DCP still gets indexed (just with its own separate torrent).
+// Returns (false, nil) if no duplicate was found — caller should proceed normally.
+func (idx *Indexer) handleDuplicateByCPL(info *DCPPackageInfo, cplUUID, localAssetMapUUID uuid.UUID) (bool, error) {
+	// Look for a package with this CPL UUID that has a DIFFERENT assetmap_uuid
+	canonicalPkg, err := idx.db.GetDCPPackageByCPLUUID(cplUUID)
+	if err != nil {
+		return false, fmt.Errorf("CPL lookup failed: %w", err)
+	}
+	if canonicalPkg == nil {
+		return false, nil // No existing package — not a duplicate
+	}
+	if canonicalPkg.AssetMapUUID == localAssetMapUUID {
+		return false, nil // Same ASSETMAP UUID — same physical package, normal upsert path
+	}
+
+	log.Printf("[dedup] Found canonical package %s (assetmap %s) matching local CPL %s (local assetmap %s)",
+		canonicalPkg.PackageName, canonicalPkg.AssetMapUUID, cplUUID, localAssetMapUUID)
+
+	// Link this server's inventory to the canonical package
+	now := time.Now()
+	inventory := &db.ServerDCPInventory{
+		ID:           uuid.New(),
+		ServerID:     idx.serverID,
+		PackageID:    canonicalPkg.ID,
+		LocalPath:    filepath.Clean(info.PackagePath),
+		Status:       "online",
+		LastVerified: now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := idx.db.UpsertServerDCPInventory(inventory); err != nil {
+		return true, fmt.Errorf("failed to link inventory to canonical package: %w", err)
+	}
+
+	// Check if a torrent already exists for the canonical package
+	torrentRec, err := idx.db.GetTorrentByPackageID(canonicalPkg.ID)
+	if err != nil {
+		return true, fmt.Errorf("failed to check torrent for canonical package: %w", err)
+	}
+	if torrentRec == nil {
+		// Torrent not yet generated for the canonical package. The first server to finish
+		// hashing will create it; this server should wait and will be picked up on the
+		// next periodic scan when the torrent is available.
+		log.Printf("[dedup] Canonical package %s has no torrent yet — inventory linked, will co-seed when torrent is ready", canonicalPkg.PackageName)
+		return true, nil
+	}
+
+	// Torrent exists — fetch canonical XML files and write them to the shadow directory.
+	// We do NOT overwrite the library XML files because RosettaBridge depends on them.
+	// Instead, the canonical XML files are stored in a separate shadow directory, and
+	// the torrent seeding layer uses a split-path storage that reads MXF files from the
+	// library and XML files from the shadow directory.
+	log.Printf("[dedup] Fetching canonical XML files for CPL %s from main server", cplUUID)
+	canonicalXML, err := idx.settingsClient.GetCanonicalXML(cplUUID.String())
+	if err != nil {
+		return true, fmt.Errorf("failed to fetch canonical XML: %w", err)
+	}
+	if canonicalXML == nil {
+		return true, fmt.Errorf("main server returned no canonical XML for CPL %s", cplUUID)
+	}
+
+	// Determine shadow directory for this package's canonical XML files.
+	// Shadow path: <shadowXMLBase>/<canonical_package_id>/
+	shadowDir := idx.shadowXMLBase
+	if shadowDir == "" {
+		// Fallback: use a sibling of the torrent download location if configured,
+		// otherwise use a subdirectory alongside the package
+		shadowDir = filepath.Join(filepath.Dir(info.PackagePath), ".canonical-xml")
+	}
+	shadowPackageDir := filepath.Join(shadowDir, canonicalPkg.ID.String())
+
+	if err := api.ApplyCanonicalXML(shadowPackageDir, canonicalXML.Files); err != nil {
+		return true, fmt.Errorf("failed to write canonical XML to shadow dir %s: %w", shadowPackageDir, err)
+	}
+	log.Printf("[dedup] Wrote %d canonical XML files to shadow dir %s", len(canonicalXML.Files), shadowPackageDir)
+
+	// Start seeding the canonical torrent using split-path storage:
+	//   - MXF/large files come from info.PackagePath (the original library location)
+	//   - XML/small files come from shadowPackageDir
+	if idx.torrentQueue != nil {
+		if err := idx.torrentQueue.StartSeedingExisting(canonicalXML.TorrentFile, info.PackagePath, shadowPackageDir, canonicalPkg.ID.String(), torrentRec.ID); err != nil {
+			log.Printf("[dedup] Warning: failed to start seeding canonical torrent for %s: %v", canonicalPkg.PackageName, err)
+			// Non-fatal: inventory is linked, seeding will be picked up by SeedExisting on next restart
+		} else {
+			log.Printf("[dedup] Started co-seeding canonical torrent %s for %s (MXF from %s, XML from %s)",
+				torrentRec.InfoHash[:12], canonicalPkg.PackageName, info.PackagePath, shadowPackageDir)
+		}
+	}
+
+	return true, nil
+}
+
 // indexComposition stores a CPL to the database
 func (idx *Indexer) indexComposition(packageID uuid.UUID, cpl *parser.CompositionPlaylist) error {
 	cplUUID, err := uuid.Parse(parser.ExtractUUID(cpl.ID))
@@ -214,7 +350,7 @@ func (idx *Indexer) indexComposition(packageID uuid.UUID, cpl *parser.Compositio
 		comp.EditRate = metadata.EditRate
 		comp.MainSoundConfiguration = metadata.MainSoundConfiguration
 		comp.MainSoundSampleRate = metadata.MainSoundSampleRate
-		comp.Luminance = metadata.Luminance
+		comp.Luminance = int(metadata.Luminance)
 		comp.ReleaseTerritory = metadata.ReleaseTerritory
 		comp.Distributor = metadata.Distributor
 		comp.Facility = metadata.Facility
@@ -261,10 +397,10 @@ func (idx *Indexer) indexReel(compositionID uuid.UUID, reelNumber int, reel *par
 	
 	if reel.AssetList.MainPicture != nil {
 		pic := reel.AssetList.MainPicture
-		dbReel.DurationFrames = pic.Duration
+		dbReel.DurationFrames = int(pic.Duration)
 		dbReel.PictureEditRate = pic.EditRate
-		dbReel.PictureEntryPoint = pic.EntryPoint
-		dbReel.PictureIntrinsicDuration = pic.IntrinsicDuration
+		dbReel.PictureEntryPoint = int(pic.EntryPoint)
+		dbReel.PictureIntrinsicDuration = int(pic.IntrinsicDuration)
 		dbReel.PictureHash = pic.Hash
 		
 		if picUUID, err := uuid.Parse(parser.ExtractUUID(pic.ID)); err == nil {
@@ -411,8 +547,10 @@ func contains(s, substr string) bool {
 		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr))
 }
 
-// checkTorrentStatus checks if a torrent exists for this package
-// If not, adds it to the generation queue
+// checkTorrentStatus checks if a torrent exists for this package.
+// If no torrent exists and the package isn't actively queued (queued/generating),
+// it adds or re-queues the package for generation. This handles restart resilience:
+// stale queue entries (failed/cancelled/completed without a torrent) get reset.
 func (idx *Indexer) checkTorrentStatus(packageID uuid.UUID, assetMapUUID uuid.UUID) error {
 	// Check if torrent already exists for this package
 	var torrentExists bool
@@ -423,43 +561,30 @@ func (idx *Indexer) checkTorrentStatus(packageID uuid.UUID, assetMapUUID uuid.UU
 	}
 
 	if torrentExists {
-		log.Printf("Torrent already exists for package %s", packageID)
 		return nil
 	}
 
-	// For client servers, try to download existing torrent from main server first
-	if idx.isClientMode && idx.torrentDownloader != nil {
-		// Get package path from inventory
-		var packagePath string
-		pathQuery := `SELECT local_path FROM server_dcp_inventory WHERE server_id = $1 AND package_id = $2`
-		err := idx.db.DB.QueryRow(pathQuery, idx.serverID.String(), packageID.String()).Scan(&packagePath)
-		if err == nil && packagePath != "" {
-			downloaded, err := idx.torrentDownloader.TryDownloadExistingTorrent(packageID, packagePath)
-			if err != nil {
-				log.Printf("Warning: failed to download torrent from main server: %v", err)
-				// Fall through to local generation
-			} else if downloaded {
-				log.Printf("Successfully downloaded existing torrent for package %s, skipping local generation", packageID)
-				return nil
-			}
-			// If torrent doesn't exist on main server, fall through to local generation
-		}
-	}
-
-	// Check if already in queue
-	var inQueue bool
-	queueQuery := `SELECT EXISTS(SELECT 1 FROM torrent_queue WHERE package_id = $1 AND server_id = $2)`
-	err = idx.db.DB.QueryRow(queueQuery, packageID.String(), idx.serverID.String()).Scan(&inQueue)
+	// No torrent exists. Only skip if the package is ACTIVELY being processed
+	// (queued or generating). Stale entries (failed/cancelled/completed) should
+	// be reset since the package still needs a torrent.
+	var activeInQueue bool
+	queueQuery := `SELECT EXISTS(SELECT 1 FROM torrent_queue WHERE package_id = $1 AND server_id = $2 AND status IN ('queued', 'generating'))`
+	err = idx.db.DB.QueryRow(queueQuery, packageID.String(), idx.serverID.String()).Scan(&activeInQueue)
 	if err != nil {
 		return fmt.Errorf("failed to check queue status: %w", err)
 	}
 
-	if inQueue {
-		log.Printf("Package %s already in torrent queue", packageID)
+	if activeInQueue {
 		return nil
 	}
 
-	// Add to torrent generation queue
-	log.Printf("Adding package %s to torrent generation queue", packageID)
+	// Check with orchestrator (main server) if we should hash this package.
+	// Another server may already be hashing it, or the torrent may already exist on main server.
+	if !idx.torrentQueue.ShouldHash(assetMapUUID.String()) {
+		return nil // Another server is handling it
+	}
+
+	// Package needs a torrent and is not actively queued - add or re-queue it
+	log.Printf("Package %s has no torrent, queuing for generation", packageID)
 	return idx.torrentQueue.AddToQueue(packageID.String())
 }

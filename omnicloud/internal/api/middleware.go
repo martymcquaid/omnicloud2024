@@ -3,6 +3,7 @@ package api
 import (
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,6 +106,49 @@ func (s *Server) authorizationMiddleware(next http.Handler) http.Handler {
 		}
 		
 		// Server is authorized, continue
+		next.ServeHTTP(w, r)
+	})
+}
+
+// userAuthMiddleware protects API routes accessed by the web UI.
+// It requires a valid session token in the Authorization header.
+// Server-to-server calls (with X-Server-ID header) bypass this check.
+func (s *Server) userAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// Public paths that never require user auth (install script, health, registration)
+		pathNorm := strings.TrimSuffix(path, "/")
+		if strings.HasSuffix(pathNorm, "/auth/login") ||
+			strings.HasSuffix(pathNorm, "/auth/session") ||
+			strings.HasSuffix(pathNorm, "/health") ||
+			strings.HasSuffix(pathNorm, "/servers/register") ||
+			strings.HasSuffix(pathNorm, "/versions/latest") ||
+			pathNorm == "/api/v1/versions/latest" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Server-to-server calls use X-Server-ID – skip user auth
+		if r.Header.Get("X-Server-ID") != "" || r.Header.Get("X-MAC-Address") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Extract bearer token
+		token := extractBearerToken(r)
+		if token == "" {
+			respondError(w, http.StatusUnauthorized, "Authentication required", "Please log in to access this resource")
+			return
+		}
+
+		// Validate session
+		session, err := s.database.GetSession(token)
+		if err != nil || session == nil {
+			respondError(w, http.StatusUnauthorized, "Session expired", "Please log in again")
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }

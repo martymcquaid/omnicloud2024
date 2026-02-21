@@ -32,6 +32,7 @@ type Config struct {
 	
 	// Torrent configuration
 	TrackerPort                 int // Port for BitTorrent tracker (main server only)
+	TorrentDataPort             int // Port for BitTorrent data (seeding/downloading); 0 = auto-pick
 	TorrentDataDir              string
 	MaxUploadRate               int // bytes/sec, 0 = unlimited
 	MaxDownloadRate             int // bytes/sec, 0 = unlimited
@@ -39,6 +40,11 @@ type Config struct {
 	MaxConcurrentDownloads      int
 	PieceHashWorkers            int // Parallel workers for hashing (per torrent)
 	MaxTorrentGenerationWorkers int // Concurrent DCP torrent generations; 0 = use CPU count
+
+	// Relay configuration (NAT traversal)
+	RelayEnabled     bool   // Enable relay server (main) / relay client (client)
+	RelayPort        int    // Relay server listening port (main server only); default 10866
+	RelayMaxSessions int    // Max concurrent relay sessions; default 100
 }
 
 // Load reads configuration from auth.config file and environment variables
@@ -60,6 +66,7 @@ func Load(configPath string) (*Config, error) {
 		
 		// Torrent defaults
 		TrackerPort:            10859,
+		TorrentDataPort:        0, // 0 = auto-pick free port
 		TorrentDataDir:         "/opt/OmniCloud/omnicloud2024/omnicloud/data/torrents",
 		MaxUploadRate:          0, // unlimited
 		MaxDownloadRate:        0, // unlimited
@@ -67,6 +74,11 @@ func Load(configPath string) (*Config, error) {
 		MaxConcurrentDownloads:      5,
 		PieceHashWorkers:            0, // 0 = auto (CPU count)
 		MaxTorrentGenerationWorkers: 0, // 0 = auto (CPU count)
+
+		// Relay defaults
+		RelayEnabled:     true,  // Relay enabled by default
+		RelayPort:        10866, // Default relay port
+		RelayMaxSessions: 100,
 	}
 
 	// Try to load from auth.config if it exists
@@ -89,6 +101,12 @@ func Load(configPath string) (*Config, error) {
 	}
 	if cfg.PieceHashWorkers <= 0 {
 		cfg.PieceHashWorkers = numCPU
+	}
+	// Cap piece-hash workers to avoid excessive memory usage during torrent generation.
+	// Each worker holds one full piece in memory (e.g. 16-32MB), so 16 workers = 256-512MB max.
+	const maxPieceHashWorkers = 16
+	if cfg.PieceHashWorkers > maxPieceHashWorkers {
+		cfg.PieceHashWorkers = maxPieceHashWorkers
 	}
 	// Default max concurrent torrent generations to 2 (I/O heavy; override in config for more)
 	if cfg.MaxTorrentGenerationWorkers <= 0 {
@@ -169,6 +187,10 @@ func (cfg *Config) loadFromFile(path string) error {
 			if port, err := strconv.Atoi(value); err == nil {
 				cfg.TrackerPort = port
 			}
+		case "torrent_data_port":
+			if port, err := strconv.Atoi(value); err == nil {
+				cfg.TorrentDataPort = port
+			}
 		case "torrent_data_dir":
 			cfg.TorrentDataDir = value
 		case "max_upload_rate":
@@ -201,6 +223,16 @@ func (cfg *Config) loadFromFile(path string) error {
 		cfg.ServerName = value
 	case "server_location":
 		cfg.ServerLocation = value
+	case "relay_enabled":
+		cfg.RelayEnabled = value == "true" || value == "1" || value == "yes"
+	case "relay_port":
+		if port, err := strconv.Atoi(value); err == nil {
+			cfg.RelayPort = port
+		}
+	case "relay_max_sessions":
+		if max, err := strconv.Atoi(value); err == nil {
+			cfg.RelayMaxSessions = max
+		}
 		}
 	}
 
@@ -259,6 +291,11 @@ func (cfg *Config) loadFromEnv() {
 			cfg.TrackerPort = port
 		}
 	}
+	if v := os.Getenv("TORRENT_DATA_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil {
+			cfg.TorrentDataPort = port
+		}
+	}
 	if v := os.Getenv("TORRENT_DATA_DIR"); v != "" {
 		cfg.TorrentDataDir = v
 	}
@@ -290,6 +327,19 @@ func (cfg *Config) loadFromEnv() {
 	if v := os.Getenv("MAX_TORRENT_GENERATION_WORKERS"); v != "" {
 		if workers, err := strconv.Atoi(v); err == nil {
 			cfg.MaxTorrentGenerationWorkers = workers
+		}
+	}
+	if v := os.Getenv("RELAY_ENABLED"); v != "" {
+		cfg.RelayEnabled = v == "true" || v == "1" || v == "yes"
+	}
+	if v := os.Getenv("RELAY_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil {
+			cfg.RelayPort = port
+		}
+	}
+	if v := os.Getenv("RELAY_MAX_SESSIONS"); v != "" {
+		if max, err := strconv.Atoi(v); err == nil {
+			cfg.RelayMaxSessions = max
 		}
 	}
 }

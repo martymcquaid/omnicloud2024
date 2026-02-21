@@ -2,13 +2,17 @@ package api
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -195,7 +199,7 @@ func (s *Server) handleListTorrents(w http.ResponseWriter, r *http.Request) {
 			ids = append(ids, torrents[i].ID)
 		}
 		statusQuery := `
-			SELECT sts.torrent_id, sts.server_id, COALESCE(s.name, '') AS server_name, sts.status, COALESCE(sts.error_message, '')
+			SELECT sts.torrent_id, sts.server_id, COALESCE(NULLIF(TRIM(s.display_name), ''), s.name, '') AS server_name, sts.status, COALESCE(sts.error_message, '')
 			FROM server_torrent_status sts
 			LEFT JOIN servers s ON s.id = sts.server_id
 			WHERE sts.torrent_id = ANY($1)
@@ -845,8 +849,8 @@ func (s *Server) handleListTransfers(w http.ResponseWriter, r *http.Request) {
 		       t.download_speed_bps, t.upload_speed_bps, t.peers_connected, t.eta_seconds,
 		       t.error_message, t.started_at, t.completed_at, t.created_at, t.updated_at,
 		       dt.package_id, dp.package_name,
-		       COALESCE(dst_srv.name, '') AS destination_server_name,
-		       COALESCE(src_srv.name, '') AS source_server_name,
+		       COALESCE(NULLIF(TRIM(dst_srv.display_name), ''), dst_srv.name, '') AS destination_server_name,
+		       COALESCE(NULLIF(TRIM(src_srv.display_name), ''), src_srv.name, '') AS source_server_name,
 		       COALESCE(dt.total_size_bytes, dp.total_size_bytes, 0) AS total_size_bytes
 		FROM transfers t
 		LEFT JOIN dcp_torrents dt ON t.torrent_id = dt.id
@@ -969,6 +973,7 @@ func (s *Server) handleCreateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logActivity(r, "transfer.create", "transfers", "transfer", id, "", "", "success")
 	respondJSON(w, http.StatusCreated, map[string]string{
 		"id":      id,
 		"message": "Transfer created successfully",
@@ -1141,6 +1146,7 @@ func (s *Server) handleDeleteTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[transfers] Transfer %s %s", transferID, action)
 
+	s.logActivity(r, "transfer.delete", "transfers", "transfer", transferID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{
 		"message": "Transfer " + action,
 	})
@@ -1164,6 +1170,7 @@ func (s *Server) handlePauseTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[transfers] Transfer %s paused", transferID)
+	s.logActivity(r, "transfer.pause", "transfers", "transfer", transferID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{"message": "Transfer paused"})
 }
 
@@ -1185,6 +1192,7 @@ func (s *Server) handleResumeTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[transfers] Transfer %s resumed", transferID)
+	s.logActivity(r, "transfer.resume", "transfers", "transfer", transferID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{"message": "Transfer resumed"})
 }
 
@@ -1222,6 +1230,7 @@ func (s *Server) handleRetryTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Transfer %s retried (reset to queued)", transferID)
+	s.logActivity(r, "transfer.retry", "transfers", "transfer", transferID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{
 		"message": "Transfer queued for retry",
 	})
@@ -1262,7 +1271,7 @@ func (s *Server) handleListTorrentQueue(w http.ResponseWriter, r *http.Request) 
 			tq.package_id,
 			COALESCE(NULLIF(TRIM(dp.content_title), ''), NULLIF(TRIM(dp.package_name), ''), '(Unknown package)') as package_name,
 			tq.server_id,
-			COALESCE(NULLIF(TRIM(srv.name), ''), 'Unknown Server') as server_name,
+			COALESCE(NULLIF(TRIM(srv.display_name), ''), NULLIF(TRIM(srv.name), ''), 'Unknown Server') as server_name,
 			tq.status,
 			tq.progress_percent,
 			tq.current_file,
@@ -1704,6 +1713,7 @@ func (s *Server) handleRetryQueueItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logActivity(r, "queue.retry", "torrents", "queue_item", queueItemID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{
 		"message": "Queue item retry scheduled successfully",
 	})
@@ -1779,6 +1789,7 @@ func (s *Server) handleCancelQueueItem(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Cancelled queue item %s (package=%s, server=%s)", queueItemID, packageID, serverID)
 
+	s.logActivity(r, "queue.cancel", "torrents", "queue_item", queueItemID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{
 		"message": "Queue item cancelled successfully",
 	})
@@ -1795,6 +1806,7 @@ func (s *Server) handleClearCompletedQueue(w http.ResponseWriter, r *http.Reques
 	}
 
 	affected, _ := result.RowsAffected()
+	s.logActivity(r, "queue.clear", "torrents", "", "", "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Completed items cleared successfully",
 		"count":   affected,
@@ -1828,8 +1840,8 @@ func (s *Server) handleGetPackageServerStatus(w http.ResponseWriter, r *http.Req
 	vars := mux.Vars(r)
 	packageID := vars["id"]
 
-	// Get all servers
-	serverRows, err := s.db.Query("SELECT id, name, last_seen FROM servers ORDER BY name")
+	// Get all servers (use display_name when set for UI)
+	serverRows, err := s.db.Query("SELECT id, COALESCE(NULLIF(TRIM(display_name), ''), name) AS name, last_seen FROM servers ORDER BY name")
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to query servers", "")
 		return
@@ -2131,5 +2143,123 @@ func (s *Server) handleCreateContentCommand(w http.ResponseWriter, r *http.Reque
 	}
 
 	log.Printf("[content-cmd] Created delete command for package %s on server %s", packageName, req.ServerID)
+	s.logActivity(r, "content.command", "content", "package", req.PackageID, "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]string{"message": "Delete command queued"})
+}
+
+// CanonicalXMLRequest asks the main server for the canonical XML metadata files for a DCP
+// identified by CPL UUID. The client replaces its local XML files with these so it can
+// co-seed the canonical torrent (which was built from the original server's XML files).
+type CanonicalXMLRequest struct {
+	CPLUUID string `json:"cpl_uuid"`
+}
+
+// CanonicalXMLResponse returns base64-encoded XML file contents keyed by filename.
+// Only non-MXF files are included (ASSETMAP.xml, PKL*.xml, VOLINDEX.xml, CPL.xml, etc.)
+type CanonicalXMLResponse struct {
+	// PackageID is the canonical package ID that the client should link its inventory to
+	PackageID string `json:"package_id"`
+	// AssetMapUUID is the canonical ASSETMAP UUID (from the original package)
+	AssetMapUUID string `json:"assetmap_uuid"`
+	// InfoHash is the info_hash of the existing torrent the client should seed
+	InfoHash string `json:"info_hash"`
+	// TorrentFile is the base64-encoded .torrent file bytes
+	TorrentFile string `json:"torrent_file"`
+	// Files maps relative filename -> base64-encoded file content
+	Files map[string]string `json:"files"`
+}
+
+// handleGetCanonicalXML returns the canonical XML metadata files for a DCP package
+// identified by its CPL UUID. Called by client servers during deduplication to obtain
+// the exact XML bytes needed to co-seed an existing torrent.
+func (s *Server) handleGetCanonicalXML(w http.ResponseWriter, r *http.Request) {
+	var req CanonicalXMLRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", "")
+		return
+	}
+
+	cplUUID, err := uuid.Parse(req.CPLUUID)
+	if err != nil || req.CPLUUID == "" {
+		respondError(w, http.StatusBadRequest, "Invalid cpl_uuid", "")
+		return
+	}
+
+	// Find the canonical package by CPL UUID
+	canonicalPkg, err := s.database.GetDCPPackageByCPLUUID(cplUUID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query package", "")
+		return
+	}
+	if canonicalPkg == nil {
+		respondError(w, http.StatusNotFound, "No package found with this CPL UUID", "")
+		return
+	}
+
+	// Check if a torrent exists for this package
+	torrentRec, err := s.database.GetTorrentByPackageID(canonicalPkg.ID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to query torrent", "")
+		return
+	}
+	if torrentRec == nil {
+		// Torrent not yet generated — client should wait
+		respondError(w, http.StatusNotFound, "Torrent not yet generated for canonical package", "")
+		return
+	}
+
+	// Find a server that has this package in inventory so we can read its files
+	var localPath string
+	err = s.db.QueryRow(`
+		SELECT i.local_path FROM server_dcp_inventory i
+		WHERE i.package_id = $1 AND i.status = 'online'
+		ORDER BY i.last_verified DESC LIMIT 1
+	`, canonicalPkg.ID).Scan(&localPath)
+	if err == sql.ErrNoRows {
+		respondError(w, http.StatusServiceUnavailable, "No online server has this package", "")
+		return
+	} else if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to find local path", "")
+		return
+	}
+
+	// Walk the package directory and collect all non-MXF files (the XML metadata)
+	files := make(map[string]string)
+	err = filepath.Walk(localPath, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() {
+			return walkErr
+		}
+		// Only collect XML/metadata files, not large MXF essence files
+		ext := strings.ToLower(filepath.Ext(info.Name()))
+		if ext == ".mxf" {
+			return nil
+		}
+		relPath, err := filepath.Rel(localPath, path)
+		if err != nil {
+			return nil
+		}
+		data, err := ioutil.ReadFile(path)
+		if err != nil {
+			log.Printf("[canonical-xml] Warning: could not read %s: %v", path, err)
+			return nil
+		}
+		files[relPath] = base64.StdEncoding.EncodeToString(data)
+		return nil
+	})
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to read package files", "")
+		return
+	}
+
+	resp := CanonicalXMLResponse{
+		PackageID:    canonicalPkg.ID.String(),
+		AssetMapUUID: canonicalPkg.AssetMapUUID.String(),
+		InfoHash:     torrentRec.InfoHash,
+		TorrentFile:  base64.StdEncoding.EncodeToString(torrentRec.TorrentFile),
+		Files:        files,
+	}
+
+	log.Printf("[canonical-xml] Serving %d XML files for CPL %s (package %s, torrent %s)",
+		len(files), cplUUID, canonicalPkg.ID, torrentRec.InfoHash[:12])
+	respondJSON(w, http.StatusOK, resp)
 }

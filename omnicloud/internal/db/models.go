@@ -9,7 +9,8 @@ import (
 // Server represents a server in the network
 type Server struct {
 	ID                  uuid.UUID
-	Name                string
+	Name                string    // Reported by device (hostname); may be overwritten on sync
+	DisplayName         string    // User-defined label; never overwritten by client sync
 	Location            string
 	APIURL              string
 	MACAddress          string
@@ -131,6 +132,62 @@ type ServerDCPInventory struct {
 	LastVerified time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// User represents a web UI user
+type User struct {
+	ID           uuid.UUID
+	Username     string
+	PasswordHash string
+	Role         string
+	IsActive     bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// UserSession represents an active login session
+type UserSession struct {
+	Token     string
+	UserID    uuid.UUID
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+// RolePermission defines what pages a role can access
+type RolePermission struct {
+	Role         string
+	AllowedPages string // JSON array string e.g. '["dcps","servers"]'
+	Description  string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// ActivityLog represents a user action audit trail entry
+type ActivityLog struct {
+	ID           uuid.UUID
+	UserID       *uuid.UUID
+	Username     string
+	Action       string
+	Category     string
+	ResourceType string
+	ResourceID   string
+	ResourceName string
+	Details      string // JSON string with action-specific data
+	IPAddress    string
+	Status       string // "success" or "failure"
+	CreatedAt    time.Time
+}
+
+// ActivityLogFilter holds parameters for listing activity logs with pagination
+type ActivityLogFilter struct {
+	Category  string
+	Action    string
+	UserID    *uuid.UUID
+	Search    string
+	StartDate *time.Time
+	EndDate   *time.Time
+	Limit     int
+	Offset    int
 }
 
 // ScanLog represents an audit log entry

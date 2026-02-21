@@ -4,15 +4,18 @@
 VERSION ?= $(shell date -u +%Y%m%d-%H%M%S)
 LDFLAGS := -ldflags "-X main.Version=$(VERSION)"
 
+# Build from current directory (omnicloud) which has the latest code with version control
 build:
 	@echo "Building OmniCloud v$(VERSION)..."
 	@mkdir -p bin
-	go build $(LDFLAGS) -o bin/omnicloud cmd/omnicloud/main.go
+	@echo "Building static binary (CGO_ENABLED=0) for maximum compatibility..."
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -a -installsuffix cgo -o "$(CURDIR)/bin/omnicloud" ./cmd/omnicloud
 
 release:
 	@echo "Building release for OmniCloud v$(VERSION)..."
 	@mkdir -p bin
-	CGO_ENABLED=1 go build $(LDFLAGS) -o bin/omnicloud cmd/omnicloud/main.go
+	@echo "Building static binary (CGO_ENABLED=0) for maximum compatibility..."
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -a -installsuffix cgo -o "$(CURDIR)/bin/omnicloud" ./cmd/omnicloud
 
 run: build
 	@echo "Starting OmniCloud..."

@@ -2,6 +2,118 @@
   "latest_version": "20260217-004204",
   "versions": [
     {
+      "version": "20260218-022323",
+      "build_time": "2026-02-18T02:23:23Z",
+      "checksum": "3e11b43b434d523cc050ea3c0d2c551059ce72901c7c4a69d1c8761b6e1fa0fd",
+      "size_bytes": 9349080,
+      "download_url": "/releases/omnicloud-20260218-022323-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260218-015624",
+      "build_time": "2026-02-18T01:56:24Z",
+      "checksum": "41791d1b8c1fd37d89afc7dbec7ab3e07607d7857c39cf620aff1f64aec8fae3",
+      "size_bytes": 9332964,
+      "download_url": "/releases/omnicloud-20260218-015624-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260218-000752",
+      "build_time": "2026-02-18T00:07:52Z",
+      "checksum": "978acfb1426759880c101323bdac07faf4a08ba0fba2cca76610b5a969aa5588",
+      "size_bytes": 9327953,
+      "download_url": "/releases/omnicloud-20260218-000752-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-235335",
+      "build_time": "2026-02-17T23:53:35Z",
+      "checksum": "e6e7df821981d174c40a9c8c538715da0d79ef30d30db439d7b2b30925c41e14",
+      "size_bytes": 9322423,
+      "download_url": "/releases/omnicloud-20260217-235335-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-230435",
+      "build_time": "2026-02-17T23:04:35Z",
+      "checksum": "174565aacaef347279c9b992646a156e7b23a834b0ec07b710e23fa00fab55d7",
+      "size_bytes": 9286565,
+      "download_url": "/releases/omnicloud-20260217-230435-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-165915",
+      "build_time": "2026-02-17T16:59:15Z",
+      "checksum": "6d43c3e6ab500649efce7cd858301b2b191c4b484034cd4f22f1a834b94d94ab",
+      "size_bytes": 9286636,
+      "download_url": "/releases/omnicloud-20260217-165915-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-164332",
+      "build_time": "2026-02-17T16:43:32Z",
+      "checksum": "eda1f0a7b5f9f16b4d6ed338ffc920932b29cf4e6e39f6576d26d6aaf9f4fc95",
+      "size_bytes": 9282512,
+      "download_url": "/releases/omnicloud-20260217-164332-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-164256",
+      "build_time": "2026-02-17T16:42:56Z",
+      "checksum": "2f6616a83e92b784a93cefe652ac2cd9ef5551ffc1e817699734336ad3ac6aed",
+      "size_bytes": 9282518,
+      "download_url": "/releases/omnicloud-20260217-164256-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-163227",
+      "build_time": "2026-02-17T16:32:27Z",
+      "checksum": "6aaf2285b43477bee98f993f5693f71f1fddd5fd708833152da2c970277c2e02",
+      "size_bytes": 9280370,
+      "download_url": "/releases/omnicloud-20260217-163227-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-031033",
+      "build_time": "2026-02-17T03:10:33Z",
+      "checksum": "b0380902b695768220419458728e0900644742ef0b8db422939accf2888b71d4",
+      "size_bytes": 11294726,
+      "download_url": "/releases/omnicloud-20260217-031033-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-022356",
+      "build_time": "2026-02-17T02:23:56Z",
+      "checksum": "b32283036dcd21085f6f5a18983d718692a0d07cc4e43ca1bff3fbd0335612c9",
+      "size_bytes": 11286117,
+      "download_url": "/releases/omnicloud-20260217-022356-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-020827",
+      "build_time": "2026-02-17T02:08:27Z",
+      "checksum": "a9a876d5a7aa4cb19c6561d5bf63e8e114afec9501b12b1292dd37e2fc61547f",
+      "size_bytes": 11284891,
+      "download_url": "/releases/omnicloud-20260217-020827-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-012433",
+      "build_time": "2026-02-17T01:24:33Z",
+      "checksum": "80e229a63092f0c13d0cee0ccc86aff1805fc54175cfb0f28c4171bcf394eb25",
+      "size_bytes": 11284590,
+      "download_url": "/releases/omnicloud-20260217-012433-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
+      "version": "20260217-011559",
+      "build_time": "2026-02-17T01:15:59Z",
+      "checksum": "8894de45e53d6bebfca42dea97541ff91a43701b6397736fea991e91eb791124",
+      "size_bytes": 11282706,
+      "download_url": "/releases/omnicloud-20260217-011559-linux-amd64.tar.gz",
+      "is_stable": true
+    },
+    {
       "version": "20260217-004204",
       "build_time": "2026-02-17T00:42:04Z",
       "checksum": "427148cfdb21fd87841f402013e15bd6833a7edb5cddbfb48407ee368e2e2bf9",
@@ -37,11 +149,11 @@
     }
   ],
   "latest": {
-    "version": "20260217-004204",
-    "build_time": "2026-02-17T00:42:04Z",
-    "checksum": "427148cfdb21fd87841f402013e15bd6833a7edb5cddbfb48407ee368e2e2bf9",
-    "size_bytes": 11221967,
-    "download_url": "/releases/omnicloud-20260217-004204-linux-amd64.tar.gz",
+    "version": "20260218-022323",
+    "build_time": "2026-02-18T02:23:23Z",
+    "checksum": "3e11b43b434d523cc050ea3c0d2c551059ce72901c7c4a69d1c8761b6e1fa0fd",
+    "size_bytes": 9349080,
+    "download_url": "/releases/omnicloud-20260218-022323-linux-amd64.tar.gz",
     "is_stable": true
   }
 }

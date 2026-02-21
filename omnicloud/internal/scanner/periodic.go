@@ -1,22 +1,33 @@
 package scanner
 
 import (
+	"fmt"
 	"log"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/omnicloud/omnicloud/internal/api"
 	"github.com/omnicloud/omnicloud/internal/db"
 )
 
 // PeriodicScanner runs full scans on a schedule
 type PeriodicScanner struct {
-	scanPath     string
-	interval     time.Duration
-	database     *db.DB
-	serverID     uuid.UUID
-	indexer      *Indexer
-	stopChan     chan struct{}
+	scanPath       string          // Fallback scan path from config
+	interval       time.Duration
+	database       *db.DB
+	serverID       uuid.UUID
+	indexer        *Indexer
+	stopChan       chan struct{}
+	settingsClient *api.SettingsClient // Client to fetch library locations from main server
+
+	// Activity tracking
+	scanMu        sync.RWMutex
+	isScanning    bool
+	scanStarted   time.Time
+	scanPaths     string
+	packagesFound int
 }
 
 // NewPeriodicScanner creates a new periodic scanner
@@ -29,6 +40,11 @@ func NewPeriodicScanner(scanPath string, intervalHours int, database *db.DB, ser
 		indexer:  NewIndexer(database, serverID),
 		stopChan: make(chan struct{}),
 	}
+}
+
+// SetSettingsClient sets the settings client for fetching library locations from main server
+func (ps *PeriodicScanner) SetSettingsClient(client *api.SettingsClient) {
+	ps.settingsClient = client
 }
 
 // GetIndexer returns the indexer for configuration
@@ -58,6 +74,20 @@ func (ps *PeriodicScanner) RunFullScan() {
 	ps.runFullScan()
 }
 
+// IsScanning returns whether a scan is currently running
+func (ps *PeriodicScanner) IsScanning() bool {
+	ps.scanMu.RLock()
+	defer ps.scanMu.RUnlock()
+	return ps.isScanning
+}
+
+// GetScanState returns the current scan state for activity reporting
+func (ps *PeriodicScanner) GetScanState() (bool, time.Time, string, int) {
+	ps.scanMu.RLock()
+	defer ps.scanMu.RUnlock()
+	return ps.isScanning, ps.scanStarted, ps.scanPaths, ps.packagesFound
+}
+
 // scheduleScans runs full scans on the configured interval
 func (ps *PeriodicScanner) scheduleScans() {
 	ticker := time.NewTicker(ps.interval)
@@ -78,7 +108,51 @@ func (ps *PeriodicScanner) scheduleScans() {
 // runFullScan performs a complete scan of the archive
 func (ps *PeriodicScanner) runFullScan() {
 	startTime := time.Now()
-	log.Printf("Starting full scan of: %s", ps.scanPath)
+
+	// Track scan state for activity reporting
+	ps.scanMu.Lock()
+	ps.isScanning = true
+	ps.scanStarted = startTime
+	ps.packagesFound = 0
+	ps.scanMu.Unlock()
+	defer func() {
+		ps.scanMu.Lock()
+		ps.isScanning = false
+		ps.scanMu.Unlock()
+	}()
+
+	// Determine which library paths to scan
+	var scanPaths []string
+
+	// Try to fetch library locations from main server (for client sites)
+	if ps.settingsClient != nil {
+		locations, err := ps.settingsClient.GetLibraryLocations()
+		if err != nil {
+			log.Printf("Warning: Failed to fetch library locations from main server: %v", err)
+			log.Printf("Falling back to config file scan path: %s", ps.scanPath)
+			scanPaths = []string{ps.scanPath}
+		} else if len(locations) == 0 {
+			log.Printf("No library locations configured on main server, using config file path: %s", ps.scanPath)
+			scanPaths = []string{ps.scanPath}
+		} else {
+			log.Printf("Fetched %d library location(s) from main server", len(locations))
+			scanPaths = locations
+		}
+	} else {
+		// Main server or no settings client configured - use config file path
+		scanPaths = []string{ps.scanPath}
+		log.Printf("No settings client configured, using config file path: %s", ps.scanPath)
+	}
+
+	// Update scan paths for activity reporting
+	ps.scanMu.Lock()
+	ps.scanPaths = fmt.Sprintf("%d locations", len(scanPaths))
+	ps.scanMu.Unlock()
+
+	log.Printf("=== Starting full scan of %d location(s) ===", len(scanPaths))
+	for i, p := range scanPaths {
+		log.Printf("  Location %d: %s", i+1, p)
+	}
 
 	// Create scan log entry
 	scanLog := &db.ScanLog{
@@ -93,24 +167,43 @@ func (ps *PeriodicScanner) runFullScan() {
 		log.Printf("Error creating scan log: %v", err)
 	}
 
-	// Discover all packages
-	packages, err := DiscoverDCPPackages(ps.scanPath)
-	if err != nil {
-		log.Printf("Error discovering packages: %v", err)
-		ps.updateScanLog(scanLog, err)
+	// Discover all packages across all library locations
+	var allPackages []string
+	for i, scanPath := range scanPaths {
+		log.Printf("Scanning library %d/%d: %s", i+1, len(scanPaths), scanPath)
+		packages, err := DiscoverDCPPackages(scanPath)
+		if err != nil {
+			log.Printf("Error discovering packages in %s: %v", scanPath, err)
+			continue
+		}
+		log.Printf("Found %d packages in %s", len(packages), scanPath)
+		allPackages = append(allPackages, packages...)
+	}
+
+	log.Printf("Total packages discovered across all libraries: %d", len(allPackages))
+
+	// Update scan state for activity reporting
+	ps.scanMu.Lock()
+	ps.packagesFound = len(allPackages)
+	ps.scanMu.Unlock()
+
+	if len(allPackages) == 0 {
+		log.Printf("No packages found in any library location")
+		ps.updateScanLog(scanLog, nil)
 		return
 	}
 
-	scanLog.PackagesFound = len(packages)
-	log.Printf("Discovered %d DCP packages", len(packages))
+	scanLog.PackagesFound = len(allPackages)
+	log.Printf("Discovered %d DCP packages total", len(allPackages))
 
 	// Scan and index each package
 	added := 0
 	updated := 0
 	errors := 0
+	torrentsQueued := 0
 
-	for i, packagePath := range packages {
-		log.Printf("Scanning package %d/%d: %s", i+1, len(packages), packagePath)
+	for i, packagePath := range allPackages {
+		log.Printf("Scanning package %d/%d: %s", i+1, len(allPackages), filepath.Base(packagePath))
 
 		info, err := ScanPackage(packagePath)
 		if err != nil {
@@ -134,7 +227,7 @@ func (ps *PeriodicScanner) runFullScan() {
 			continue
 		}
 
-		// Index the package
+		// Index the package (this also queues torrent generation if needed)
 		if err := ps.indexer.IndexPackage(info); err != nil {
 			log.Printf("Error indexing package %s: %v", packagePath, err)
 			errors++
@@ -143,6 +236,7 @@ func (ps *PeriodicScanner) runFullScan() {
 
 		if existing == nil {
 			added++
+			torrentsQueued++ // New packages will have torrents queued
 		} else {
 			updated++
 		}
@@ -152,20 +246,20 @@ func (ps *PeriodicScanner) runFullScan() {
 			if err := ps.database.UpdateScanLogProgress(scanLog.ID, added, updated); err != nil {
 				log.Printf("Error updating scan progress: %v", err)
 			}
-			log.Printf("Progress: %d/%d packages processed (added: %d, updated: %d, errors: %d)",
-				i+1, len(packages), added, updated, errors)
+			log.Printf("Scan progress: %d/%d packages processed (new: %d, existing: %d, errors: %d, torrents queued: %d)",
+				i+1, len(allPackages), added, updated, errors, torrentsQueued)
 		}
 	}
 
 	// Clean up packages that are no longer available on this server
-	removed, err := ps.cleanupMissingPackages(packages)
+	removed, err := ps.cleanupMissingPackages(allPackages)
 	if err != nil {
 		log.Printf("Error during inventory cleanup: %v", err)
 		errors++
 	}
 
 	// Clean up torrent queue entries for packages no longer on this server
-	queueRemoved, err := ps.cleanupOrphanedQueueEntries(packages)
+	queueRemoved, err := ps.cleanupOrphanedQueueEntries(allPackages)
 	if err != nil {
 		log.Printf("Error during queue cleanup: %v", err)
 		errors++
@@ -181,8 +275,12 @@ func (ps *PeriodicScanner) runFullScan() {
 	}
 
 	duration := time.Since(startTime)
-	log.Printf("Full scan complete: %d packages found, %d added, %d updated, %d inventory removed, %d queue entries removed, %d errors (took %v)",
-		scanLog.PackagesFound, added, updated, removed, queueRemoved, errors, duration)
+	log.Printf("=== Full scan complete ===")
+	log.Printf("  Locations scanned: %d", len(scanPaths))
+	log.Printf("  Packages found: %d (new: %d, existing: %d)", scanLog.PackagesFound, added, updated)
+	log.Printf("  Torrents queued for generation: %d", torrentsQueued)
+	log.Printf("  Inventory removed: %d, Queue entries removed: %d", removed, queueRemoved)
+	log.Printf("  Errors: %d, Duration: %v", errors, duration)
 
 	ps.updateScanLog(scanLog, nil)
 }

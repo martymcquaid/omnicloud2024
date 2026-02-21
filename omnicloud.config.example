@@ -17,6 +17,9 @@ server_mode=main
 # API port (default: 10858)
 api_port=10858
 
+# Tracker port (default: 10851)
+tracker_port=10851
+
 # Registration key for site authentication
 # Main server: this is the key that clients must provide
 # Client server: this is the key to authenticate with main server
@@ -35,6 +38,14 @@ scan_interval=12
 # Server identification
 server_name=dcp1.omniplex.services
 server_location=Local
+
+# Public tracker URL for torrent announce (used in generated .torrent files)
+# public_tracker_url=http://YOUR_PUBLIC_IP:10851/announce
+
+# Public IP for torrent seeding: not required. The app auto-detects its public IP at startup
+# and uses it when the tracker advertises the main server to peers. Override with env
+# OMNICLOUD_TRACKER_ANNOUNCE_HOST if needed (e.g. behind NAT).
+# public_ip=1.2.3.4
 
 # max_torrent_generation_workers: how many DCPs to hash in parallel (default 2; max 32)
 # Set higher for faster hashing on powerful systems (e.g. 20 for 128-core server)

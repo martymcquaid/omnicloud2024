@@ -7,40 +7,47 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/omnicloud/omnicloud/internal/parser"
 )
 
 // DiscoverDCPPackages walks the archive directory and finds all DCP packages
 // A DCP package is identified by the presence of an ASSETMAP or ASSETMAP.xml file
 func DiscoverDCPPackages(rootPath string) ([]string, error) {
 	var packages []string
-	
+	seen := make(map[string]bool)
+
 	log.Printf("Discovering DCP packages in: %s", rootPath)
-	
+
 	// Check if root path exists
 	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("scan path does not exist: %s", rootPath)
 	}
-	
+
 	// Walk the directory tree
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Warning: error accessing path %s: %v", path, err)
 			return nil // Continue walking despite errors
 		}
-		
+
 		// Skip if not a file
 		if info.IsDir() {
 			return nil
 		}
-		
-		// Check if this is an ASSETMAP file
+
+		// Check if this is an ASSETMAP file (a directory may contain both
+		// ASSETMAP and ASSETMAP.XML; only count it once)
 		fileName := strings.ToUpper(info.Name())
 		if fileName == "ASSETMAP" || fileName == "ASSETMAP.XML" {
 			packagePath := filepath.Dir(path)
-			packages = append(packages, packagePath)
-			log.Printf("Found DCP package: %s", packagePath)
+			if !seen[packagePath] {
+				seen[packagePath] = true
+				packages = append(packages, packagePath)
+				log.Printf("Found DCP package: %s", packagePath)
+			}
 		}
-		
+
 		return nil
 	})
 	
@@ -96,6 +103,10 @@ func FindCPLFiles(packagePath string) ([]string, error) {
 		if strings.HasSuffix(strings.ToLower(name), ".cpl") {
 			cplFiles = append(cplFiles, filepath.Join(packagePath, name))
 		}
+		// RosettaBridge renames CPL files to just "CPL.xml"
+		if upperName == "CPL.XML" {
+			cplFiles = append(cplFiles, filepath.Join(packagePath, name))
+		}
 	}
 	
 	return cplFiles, nil
@@ -126,9 +137,61 @@ func FindPKLFiles(packagePath string) ([]string, error) {
 		if strings.HasSuffix(strings.ToLower(name), ".pkl") {
 			pklFiles = append(pklFiles, filepath.Join(packagePath, name))
 		}
+		// RosettaBridge renames PKL files to just "PKL.xml"
+		if upperName == "PKL.XML" {
+			pklFiles = append(pklFiles, filepath.Join(packagePath, name))
+		}
 	}
 	
 	return pklFiles, nil
+}
+
+// FindPKLFilesFromAssetMap finds PKL files using ASSETMAP asset references.
+// Use as fallback when filename-based discovery (FindPKLFiles) finds nothing.
+func FindPKLFilesFromAssetMap(packagePath string, assetMap *parser.AssetMap) []string {
+	var pklFiles []string
+	for _, asset := range assetMap.AssetList.Assets {
+		if asset.PackingList && len(asset.ChunkList.Chunks) > 0 {
+			pklPath := filepath.Join(packagePath, asset.ChunkList.Chunks[0].Path)
+			if _, err := os.Stat(pklPath); err == nil {
+				pklFiles = append(pklFiles, pklPath)
+			}
+		}
+	}
+	return pklFiles
+}
+
+// FindCPLFilesFromAssetMap finds potential CPL files using ASSETMAP asset references.
+// Looks for non-PKL, non-ASSETMAP XML files referenced in the ASSETMAP.
+func FindCPLFilesFromAssetMap(packagePath string, assetMap *parser.AssetMap) []string {
+	var cplFiles []string
+	for _, asset := range assetMap.AssetList.Assets {
+		if asset.PackingList {
+			continue // Skip PKL files
+		}
+		if len(asset.ChunkList.Chunks) == 0 {
+			continue
+		}
+		assetPath := asset.ChunkList.Chunks[0].Path
+		upperPath := strings.ToUpper(assetPath)
+		// Skip ASSETMAP references and non-XML files
+		if strings.Contains(upperPath, "ASSETMAP") {
+			continue
+		}
+		if !strings.HasSuffix(upperPath, ".XML") {
+			continue
+		}
+		// Skip MXF-related XML (e.g., subtitle XMLs typically aren't CPLs)
+		// CPLs are top-level XML files, not subdirectory files
+		if strings.Contains(assetPath, "/") {
+			continue
+		}
+		fullPath := filepath.Join(packagePath, assetPath)
+		if _, err := os.Stat(fullPath); err == nil {
+			cplFiles = append(cplFiles, fullPath)
+		}
+	}
+	return cplFiles
 }
 
 // CalculateDirectorySize calculates the total size of all files in a directory

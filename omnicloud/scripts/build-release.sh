@@ -47,6 +47,14 @@ echo "[4/8] Copying database migrations..."
 mkdir -p "$STAGING_DIR/$PACKAGE_NAME/migrations"
 cp -r internal/db/migrations/*.sql "$STAGING_DIR/$PACKAGE_NAME/migrations/"
 
+# Copy PostgreSQL 9.1 fix scripts
+echo "[4.5/8] Copying PostgreSQL 9.1 compatibility fix scripts..."
+mkdir -p "$STAGING_DIR/$PACKAGE_NAME/scripts"
+cp scripts/fix-postgresql-9.1-migrations.sh "$STAGING_DIR/$PACKAGE_NAME/scripts/" 2>/dev/null || true
+cp scripts/fix-all-postgresql-9.1-migrations.sh "$STAGING_DIR/$PACKAGE_NAME/scripts/" 2>/dev/null || true
+chmod +x "$STAGING_DIR/$PACKAGE_NAME/scripts/fix-postgresql-9.1-migrations.sh" 2>/dev/null || true
+chmod +x "$STAGING_DIR/$PACKAGE_NAME/scripts/fix-all-postgresql-9.1-migrations.sh" 2>/dev/null || true
+
 # Copy systemd service file
 echo "[5/8] Copying systemd service..."
 cp systemd/omnicloud.service "$STAGING_DIR/$PACKAGE_NAME/"

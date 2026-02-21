@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,8 +19,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/omnicloud/omnicloud/internal/relay"
 	"github.com/omnicloud/omnicloud/internal/db"
 	"github.com/omnicloud/omnicloud/internal/updater"
+	ws "github.com/omnicloud/omnicloud/internal/websocket"
 )
 
 // Response structures
@@ -55,31 +59,46 @@ type InventoryPackage struct {
 
 // TorrentStatusReport represents the status report sent from clients
 type TorrentStatusReport struct {
-	ServerID   string                 `json:"server_id"`
-	Timestamp  time.Time              `json:"timestamp"`
-	Torrents   []TorrentStatusItem    `json:"torrents"`
-	QueueItems []QueueStatusItem      `json:"queue_items,omitempty"`
-	QueueStats map[string]int         `json:"queue_stats,omitempty"`
+	ServerID    string                 `json:"server_id"`
+	Timestamp   time.Time              `json:"timestamp"`
+	Torrents    []TorrentStatusItem    `json:"torrents"`
+	QueueItems  []QueueStatusItem      `json:"queue_items,omitempty"`
+	QueueStats  map[string]int         `json:"queue_stats,omitempty"`
+	IsFullSync  bool                   `json:"is_full_sync,omitempty"`
+	// NAT/relay status
+	IsBehindNAT     bool `json:"is_behind_nat,omitempty"`
+	RelayRegistered bool `json:"relay_registered,omitempty"`
 }
 
 // TorrentStatusItem represents status for a single torrent
 type TorrentStatusItem struct {
 	InfoHash       string  `json:"info_hash"`
-	Status         string  `json:"status"`
+	Status         string  `json:"status"` // 'verifying', 'seeding', 'downloading', 'completed', 'error'
+	IsLoaded       bool    `json:"is_loaded"`
+	IsSeeding      bool    `json:"is_seeding"`
+	IsDownloading  bool    `json:"is_downloading"`
 	BytesCompleted int64   `json:"bytes_completed"`
 	BytesTotal     int64   `json:"bytes_total"`
 	Progress       float64 `json:"progress"`
+	PiecesCompleted int    `json:"pieces_completed"`
+	PiecesTotal     int    `json:"pieces_total"`
 	DownloadSpeed  int64   `json:"download_speed_bps"`
 	UploadSpeed    int64   `json:"upload_speed_bps"`
 	UploadedBytes  int64   `json:"uploaded_bytes"`
 	PeersConnected int     `json:"peers_connected"`
 	ETA            int     `json:"eta_seconds"`
+	ErrorMessage   string  `json:"error_message,omitempty"`
+	AnnouncedToTracker bool `json:"announced_to_tracker"`
+	LastAnnounceAttempt *time.Time `json:"last_announce_attempt,omitempty"`
+	LastAnnounceSuccess *time.Time `json:"last_announce_success,omitempty"`
+	AnnounceError  string  `json:"announce_error,omitempty"`
 }
 
 // QueueStatusItem represents status for a single queue item
 type QueueStatusItem struct {
 	ID              string    `json:"id"`
 	PackageID       string    `json:"package_id"`
+	AssetMapUUID    string    `json:"assetmap_uuid,omitempty"`
 	Status          string    `json:"status"`
 	ProgressPercent float64   `json:"progress_percent"`
 	CurrentFile     string    `json:"current_file,omitempty"`
@@ -107,7 +126,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleListServers returns all registered servers
 func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.database.Query("SELECT id, name, location, api_url, COALESCE(mac_address, ''), COALESCE(is_authorized, false), last_seen, storage_capacity_tb, COALESCE(software_version, ''), COALESCE(upgrade_status, 'idle'), target_version FROM servers ORDER BY name")
+	rows, err := s.database.Query("SELECT id, name, COALESCE(display_name, ''), location, api_url, COALESCE(mac_address, ''), COALESCE(is_authorized, false), last_seen, storage_capacity_tb, COALESCE(software_version, ''), COALESCE(upgrade_status, 'idle'), target_version FROM servers ORDER BY name")
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to query servers", err.Error())
 		return
@@ -117,14 +136,14 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	var servers []map[string]interface{}
 	for rows.Next() {
 		var id uuid.UUID
-		var name, location, apiURL, macAddress string
+		var name, displayName, location, apiURL, macAddress string
 		var isAuthorized bool
 		var lastSeen *time.Time
 		var capacity float64
 		var softwareVersion, upgradeStatus string
 		var targetVersion *string
 
-		if err := rows.Scan(&id, &name, &location, &apiURL, &macAddress, &isAuthorized, &lastSeen, &capacity, &softwareVersion, &upgradeStatus, &targetVersion); err != nil {
+		if err := rows.Scan(&id, &name, &displayName, &location, &apiURL, &macAddress, &isAuthorized, &lastSeen, &capacity, &softwareVersion, &upgradeStatus, &targetVersion); err != nil {
 			log.Printf("Error scanning server row: %v", err)
 			continue
 		}
@@ -132,6 +151,7 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 		server := map[string]interface{}{
 			"id":                   id,
 			"name":                 name,
+			"display_name":         displayName,
 			"location":             location,
 			"api_url":              apiURL,
 			"mac_address":          macAddress,
@@ -208,11 +228,12 @@ func (s *Server) handleRegisterServer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("Server re-registered: %s (MAC: %s, ID: %s, Version: %s)", existing.Name, reg.MACAddress, existing.ID, reg.SoftwareVersion)
+		log.Printf("Server re-registered: %s (MAC: %s, ID: %s, Version: %s, Authorized: %v)", existing.Name, reg.MACAddress, existing.ID, reg.SoftwareVersion, existing.IsAuthorized)
 		respondJSON(w, http.StatusOK, map[string]interface{}{
-			"id":      existing.ID,
-			"message": "Server re-registered successfully",
-			"status":  "existing",
+			"id":            existing.ID,
+			"message":       "Server re-registered successfully",
+			"status":        "existing",
+			"is_authorized": existing.IsAuthorized,
 		})
 		return
 	}
@@ -313,6 +334,7 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 
 	var update struct {
 		Name              *string  `json:"name"`
+		DisplayName       *string  `json:"display_name"`
 		Location          *string  `json:"location"`
 		IsAuthorized      *bool    `json:"is_authorized"`
 		StorageCapacityTB *float64 `json:"storage_capacity_tb"`
@@ -323,7 +345,7 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build dynamic update query
+	// Build dynamic update query (display_name is user-defined; name is device-reported)
 	query := "UPDATE servers SET updated_at = $1"
 	args := []interface{}{time.Now()}
 	argPos := 2
@@ -331,6 +353,12 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 	if update.Name != nil {
 		query += fmt.Sprintf(", name = $%d", argPos)
 		args = append(args, *update.Name)
+		argPos++
+	}
+
+	if update.DisplayName != nil {
+		query += fmt.Sprintf(", display_name = $%d", argPos)
+		args = append(args, *update.DisplayName)
 		argPos++
 	}
 
@@ -373,6 +401,7 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logActivity(r, "server.update", "servers", "server", serverID.String(), "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Server updated successfully",
 	})
@@ -407,6 +436,7 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Server %s has been DELETED", serverID)
+	s.logActivity(r, "server.delete", "servers", "server", serverID.String(), "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Server deleted successfully",
 	})
@@ -463,6 +493,14 @@ func (s *Server) handleUpdateInventory(w http.ResponseWriter, r *http.Request) {
 		updated++
 	}
 
+	notFound := len(update.Packages) - updated
+	if notFound > 0 {
+		log.Printf("[inventory-sync] Server %s: updated %d/%d inventory entries (%d packages not found on main server - metadata may need to sync first)",
+			serverID, updated, len(update.Packages), notFound)
+	} else {
+		log.Printf("[inventory-sync] Server %s: updated %d/%d inventory entries", serverID, updated, len(update.Packages))
+	}
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Inventory updated",
 		"updated": updated,
@@ -487,6 +525,16 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 
+	// On full sync (first report after client startup), clear ALL old queue entries
+	// for this server. The report contains the complete current state.
+	if report.IsFullSync {
+		log.Printf("[torrent-status] Full sync from server %s - clearing old queue entries", serverID)
+		_, err := s.db.Exec("DELETE FROM torrent_queue WHERE server_id = $1", serverID)
+		if err != nil {
+			log.Printf("Error clearing old queue entries: %v", err)
+		}
+	}
+
 	// Process queue items (hashing progress)
 	if len(report.QueueItems) > 0 {
 		for _, item := range report.QueueItems {
@@ -496,19 +544,35 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			packageID, err := uuid.Parse(item.PackageID)
-			if err != nil {
-				log.Printf("Invalid package ID %s: %v", item.PackageID, err)
-				continue
+			// Resolve package_id: prefer assetmap_uuid lookup (cross-server),
+			// fall back to direct package_id if assetmap_uuid not provided
+			var packageID uuid.UUID
+			if item.AssetMapUUID != "" {
+				assetMapUUID, err := uuid.Parse(item.AssetMapUUID)
+				if err != nil {
+					log.Printf("Invalid assetmap UUID %s: %v", item.AssetMapUUID, err)
+					continue
+				}
+				// Look up the main server's package_id by assetmap_uuid
+				err = s.db.QueryRow("SELECT id FROM dcp_packages WHERE assetmap_uuid = $1", assetMapUUID).Scan(&packageID)
+				if err != nil {
+					// Package not synced to main server yet - skip silently
+					continue
+				}
+			} else {
+				packageID, err = uuid.Parse(item.PackageID)
+				if err != nil {
+					log.Printf("Invalid package ID %s: %v", item.PackageID, err)
+					continue
+				}
 			}
 
 			// Upsert torrent_queue with progress from client
 			query := `
 				INSERT INTO torrent_queue (id, package_id, server_id, status, progress_percent, current_file, started_at, total_size_bytes, hashing_speed_bps, synced_at, queued_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT queued_at FROM torrent_queue WHERE id = $1), $10))
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
 				ON CONFLICT (package_id, server_id)
 				DO UPDATE SET
-					id = $1,
 					status = $4,
 					progress_percent = $5,
 					current_file = $6,
@@ -552,22 +616,48 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 				// Upsert seeder status
 				seederQuery := `
 					INSERT INTO torrent_seeders (id, torrent_id, server_id, local_path, status, uploaded_bytes, last_announce, created_at, updated_at)
-					VALUES (gen_random_uuid(), $1, $2, '', $3, $4, $5, $5, $5)
+					VALUES ($1, $2, $3, '', $4, $5, $6, $6, $6)
 					ON CONFLICT (torrent_id, server_id)
 					DO UPDATE SET
-						status = $3,
-						uploaded_bytes = $4,
-						last_announce = $5,
-						updated_at = $5
+						status = $4,
+						uploaded_bytes = $5,
+						last_announce = $6,
+						updated_at = $6
 				`
-				_, err = s.db.Exec(seederQuery, torrentID, serverID, torrent.Status, torrent.UploadedBytes, now)
+				_, err = s.db.Exec(seederQuery, uuid.New().String(), torrentID, serverID, torrent.Status, torrent.UploadedBytes, now)
 				if err != nil {
 					log.Printf("Error updating seeder: %v", err)
 				}
 			}
 
-			// Update transfers if this is downloading
-			if torrent.Status == "downloading" {
+			// Update transfers for active downloads (downloading, checking, verifying, paused, error, completed)
+			if torrent.Status == "paused" {
+				// Client reports torrent is paused — update progress but keep/confirm paused status.
+				// Only touch transfers that are paused or were just set to pause by main server.
+				pausedQuery := `
+					UPDATE transfers SET
+						progress_percent = $1,
+						downloaded_bytes = $2,
+						download_speed_bps = 0,
+						upload_speed_bps = 0,
+						peers_connected = 0,
+						eta_seconds = NULL,
+						status = 'paused',
+						updated_at = $3
+					WHERE destination_server_id = $4
+					AND status IN ('paused', 'downloading', 'checking')
+					AND EXISTS (SELECT 1 FROM dcp_torrents WHERE info_hash = $5 AND id = transfers.torrent_id)
+				`
+				_, err := s.db.Exec(pausedQuery, torrent.Progress, torrent.BytesCompleted, now, serverID, torrent.InfoHash)
+				if err != nil {
+					log.Printf("Error updating transfer to paused: %v", err)
+				}
+			} else if torrent.Status == "downloading" || torrent.Status == "verifying" || torrent.Status == "checking" {
+				// Map reported status to transfer status: "checking" stays as "checking", "downloading"/"verifying" become "downloading"
+				transferStatus := torrent.Status
+				if transferStatus == "verifying" {
+					transferStatus = "downloading"
+				}
 				transferQuery := `
 					UPDATE transfers SET
 						progress_percent = $1,
@@ -576,9 +666,11 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 						upload_speed_bps = $4,
 						peers_connected = $5,
 						eta_seconds = $6,
+						status = CASE WHEN status IN ('queued', 'checking', 'downloading') THEN $10 ELSE status END,
+						started_at = CASE WHEN started_at IS NULL THEN $7 ELSE started_at END,
 						updated_at = $7
 					WHERE destination_server_id = $8
-					AND status IN ('downloading', 'active')
+					AND status IN ('downloading', 'checking', 'active', 'queued')
 					AND EXISTS (SELECT 1 FROM dcp_torrents WHERE info_hash = $9 AND id = transfers.torrent_id)
 				`
 				_, err := s.db.Exec(transferQuery,
@@ -591,11 +683,104 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 					now,
 					serverID,
 					torrent.InfoHash,
+					transferStatus,
 				)
 				if err != nil {
 					log.Printf("Error updating transfer: %v", err)
 				}
+			} else if torrent.Status == "error" {
+				// Mark transfer as errored with the error message from the client
+				errorQuery := `
+					UPDATE transfers SET
+						status = 'error',
+						error_message = $1,
+						download_speed_bps = 0,
+						upload_speed_bps = 0,
+						updated_at = $2
+					WHERE destination_server_id = $3
+					AND status IN ('downloading', 'checking', 'active', 'queued')
+					AND EXISTS (SELECT 1 FROM dcp_torrents WHERE info_hash = $4 AND id = transfers.torrent_id)
+				`
+				_, err := s.db.Exec(errorQuery, torrent.ErrorMessage, now, serverID, torrent.InfoHash)
+				if err != nil {
+					log.Printf("Error updating transfer to error: %v", err)
+				}
+			} else if torrent.Status == "completed" && torrent.Progress >= 100 {
+				// Mark transfer as completed
+				completedQuery := `
+					UPDATE transfers SET
+						status = 'completed',
+						progress_percent = 100,
+						downloaded_bytes = $1,
+						download_speed_bps = 0,
+						upload_speed_bps = 0,
+						completed_at = $2,
+						updated_at = $2
+					WHERE destination_server_id = $3
+					AND status IN ('downloading', 'checking', 'active', 'queued')
+					AND EXISTS (SELECT 1 FROM dcp_torrents WHERE info_hash = $4 AND id = transfers.torrent_id)
+				`
+				_, err := s.db.Exec(completedQuery, torrent.BytesTotal, now, serverID, torrent.InfoHash)
+				if err != nil {
+					log.Printf("Error updating transfer to completed: %v", err)
+				}
 			}
+
+			// Upsert detailed torrent stats for all torrents (verifying, seeding, downloading)
+			statsQuery := `
+				INSERT INTO server_torrent_stats (
+					server_id, info_hash, status, is_loaded, is_seeding, is_downloading,
+					bytes_completed, bytes_total, progress_percent, pieces_completed, pieces_total,
+					download_speed_bps, upload_speed_bps, uploaded_bytes, peers_connected, eta_seconds,
+					announced_to_tracker, last_announce_attempt, last_announce_success, announce_error, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+				ON CONFLICT (server_id, info_hash)
+				DO UPDATE SET
+					status = $3,
+					is_loaded = $4,
+					is_seeding = $5,
+					is_downloading = $6,
+					bytes_completed = $7,
+					bytes_total = $8,
+					progress_percent = $9,
+					pieces_completed = $10,
+					pieces_total = $11,
+					download_speed_bps = $12,
+					upload_speed_bps = $13,
+					uploaded_bytes = $14,
+					peers_connected = $15,
+					eta_seconds = $16,
+					announced_to_tracker = $17,
+					last_announce_attempt = $18,
+					last_announce_success = $19,
+					announce_error = $20,
+					updated_at = $21
+			`
+			_, err = s.db.Exec(statsQuery,
+				serverID, torrent.InfoHash, torrent.Status, torrent.IsLoaded, torrent.IsSeeding, torrent.IsDownloading,
+				torrent.BytesCompleted, torrent.BytesTotal, torrent.Progress, torrent.PiecesCompleted, torrent.PiecesTotal,
+				torrent.DownloadSpeed, torrent.UploadSpeed, torrent.UploadedBytes, torrent.PeersConnected, torrent.ETA,
+				torrent.AnnouncedToTracker, torrent.LastAnnounceAttempt, torrent.LastAnnounceSuccess, torrent.AnnounceError, now,
+			)
+			if err != nil {
+				log.Printf("Error updating torrent stats for %s: %v", torrent.InfoHash, err)
+			}
+		}
+	}
+
+	// Update NAT/relay status if included in report
+	if report.IsBehindNAT || report.RelayRegistered {
+		_, natErr := s.db.Exec(`
+			UPDATE servers SET
+				is_behind_nat = $1,
+				relay_registered = $2,
+				nat_last_checked = $3
+			WHERE id = $4
+		`, report.IsBehindNAT, report.RelayRegistered, now, serverID)
+		if natErr != nil {
+			log.Printf("[torrent-status] Error updating NAT status for server %s: %v", serverID, natErr)
+		} else if report.IsBehindNAT {
+			log.Printf("[torrent-status] Server %s: behind_nat=%v relay_registered=%v", serverID, report.IsBehindNAT, report.RelayRegistered)
 		}
 	}
 
@@ -604,6 +789,12 @@ func (s *Server) handleTorrentStatus(w http.ResponseWriter, r *http.Request) {
 		"queue_items":  len(report.QueueItems),
 		"torrent_items": len(report.Torrents),
 	})
+}
+
+// handleNATCheck probes whether a client server's torrent data port is reachable.
+// Called by client servers to detect if they are behind NAT/firewall.
+func (s *Server) handleNATCheck(w http.ResponseWriter, r *http.Request) {
+	relay.HandleNATCheck(w, r)
 }
 
 // handleDCPMetadata receives and stores complete DCP metadata from client servers
@@ -675,6 +866,15 @@ func (s *Server) handleDCPMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 		packagesProcessed++
 
+		// Query to get the actual package ID (in case it was a conflict and existing ID differs)
+		var actualPkgID string
+		err = s.db.QueryRow("SELECT id FROM dcp_packages WHERE assetmap_uuid = $1", assetMapUUID.String()).Scan(&actualPkgID)
+		if err != nil {
+			log.Printf("Error resolving package ID for assetmap_uuid %s: %v", assetMapUUID, err)
+			continue
+		}
+		actualPkgUUID, _ := uuid.Parse(actualPkgID)
+
 		// Process compositions
 		for _, comp := range pkg.Compositions {
 			compID, _ := uuid.Parse(comp.ID)
@@ -695,7 +895,7 @@ func (s *Server) handleDCPMetadata(w http.ResponseWriter, r *http.Request) {
 			`
 
 			_, err = s.db.Exec(compQuery,
-				compID, pkgID, cplUUID, comp.ContentTitleText, comp.ContentKind,
+				compID, actualPkgUUID, cplUUID, comp.ContentTitleText, comp.ContentKind,
 				comp.IssueDate, comp.Issuer, comp.Creator, comp.EditRate, comp.FrameRate,
 				comp.ScreenAspectRatio, comp.ResolutionWidth, comp.ResolutionHeight,
 				comp.MainSoundConfiguration, comp.ReelCount, comp.TotalDurationFrames,
@@ -726,7 +926,7 @@ func (s *Server) handleDCPMetadata(w http.ResponseWriter, r *http.Request) {
 			`
 
 			_, err = s.db.Exec(assetQuery,
-				assetID, pkgID, assetUUID, asset.FilePath, asset.FileName,
+				assetID, actualPkgUUID, assetUUID, asset.FilePath, asset.FileName,
 				asset.AssetType, asset.AssetRole, asset.SizeBytes, asset.HashAlgorithm, asset.HashValue,
 				now,
 			)
@@ -738,8 +938,15 @@ func (s *Server) handleDCPMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("DCP metadata sync from server %s: %d packages, %d compositions, %d assets",
-		serverID, packagesProcessed, compositionsProcessed, assetsProcessed)
+	// Count total packages in database after sync
+	var totalPackages int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM dcp_packages").Scan(&totalPackages); err == nil {
+		log.Printf("[metadata-sync] DCP metadata sync from server %s: processed %d/%d packages, %d compositions, %d assets (total in DB now: %d)",
+			serverID, packagesProcessed, len(update.Packages), compositionsProcessed, assetsProcessed, totalPackages)
+	} else {
+		log.Printf("[metadata-sync] DCP metadata sync from server %s: processed %d/%d packages, %d compositions, %d assets",
+			serverID, packagesProcessed, len(update.Packages), compositionsProcessed, assetsProcessed)
+	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message":      "Metadata received",
@@ -803,18 +1010,94 @@ func (s *Server) handleGetServerDCPs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleListDCPs returns all DCP packages that are available on at least one server
+// handleListDCPs returns DCP packages available on at least one server.
+// Supports query params: search, content_kind, server_ids (comma-separated UUIDs),
+// limit (0 = no limit, default), offset (default 0).
 func (s *Server) handleListDCPs(w http.ResponseWriter, r *http.Request) {
-	query := `
+	q := r.URL.Query()
+	search := strings.TrimSpace(q.Get("search"))
+	contentKind := strings.TrimSpace(q.Get("content_kind"))
+	serverIDsParam := strings.TrimSpace(q.Get("server_ids"))
+
+	// limit=0 (or unset) means no limit; explicit positive value paginates
+	limit := 0
+	offset := 0
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if v, err := strconv.Atoi(q.Get("offset")); err == nil && v >= 0 {
+		offset = v
+	}
+
+	var args []interface{}
+	argIdx := 1
+
+	// Base: DCPs that exist on at least one server (online inventory) or have an active transfer
+	baseWhere := `dp.id IN (
+		SELECT package_id FROM server_dcp_inventory WHERE status = 'online'
+		UNION
+		SELECT dt.package_id FROM transfers t
+		JOIN dcp_torrents dt ON dt.id = t.torrent_id
+		WHERE t.status IN ('queued','downloading','checking','paused','error','failed')
+	)`
+
+	filterClause := baseWhere
+
+	// Filter by specific servers: only show DCPs present on at least one of the given servers
+	if serverIDsParam != "" {
+		var placeholders []string
+		for _, raw := range strings.Split(serverIDsParam, ",") {
+			sid := strings.TrimSpace(raw)
+			if _, err := uuid.Parse(sid); err == nil {
+				placeholders = append(placeholders, fmt.Sprintf("$%d", argIdx))
+				args = append(args, sid)
+				argIdx++
+			}
+		}
+		if len(placeholders) > 0 {
+			filterClause += fmt.Sprintf(` AND dp.id IN (
+				SELECT package_id FROM server_dcp_inventory
+				WHERE status = 'online' AND server_id IN (%s)
+			)`, strings.Join(placeholders, ","))
+		}
+	}
+
+	if search != "" {
+		filterClause += fmt.Sprintf(` AND (LOWER(dp.package_name) LIKE $%d OR LOWER(dp.content_title) LIKE $%d)`, argIdx, argIdx+1)
+		like := "%" + strings.ToLower(search) + "%"
+		args = append(args, like, like)
+		argIdx += 2
+	}
+	if contentKind != "" {
+		filterClause += fmt.Sprintf(` AND LOWER(dp.content_kind) = $%d`, argIdx)
+		args = append(args, strings.ToLower(contentKind))
+		argIdx++
+	}
+
+	// Count total matching rows
+	countQuery := `SELECT COUNT(DISTINCT dp.id) FROM dcp_packages dp WHERE ` + filterClause
+	var totalCount int
+	if err := s.database.QueryRow(countQuery, args...).Scan(&totalCount); err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to count DCPs", err.Error())
+		return
+	}
+
+	// Data query — paginated only when limit > 0
+	dataQuery := fmt.Sprintf(`
 		SELECT DISTINCT dp.id, dp.assetmap_uuid, dp.package_name, dp.content_title, dp.content_kind,
 		       dp.issuer, dp.total_size_bytes, dp.file_count, dp.discovered_at
 		FROM dcp_packages dp
-		INNER JOIN server_dcp_inventory sdi ON dp.id = sdi.package_id
-		WHERE sdi.status = 'online'
-		ORDER BY dp.discovered_at DESC
-		LIMIT 100`
+		WHERE %s
+		ORDER BY dp.discovered_at DESC`, filterClause)
 
-	rows, err := s.database.Query(query)
+	dataArgs := make([]interface{}, len(args))
+	copy(dataArgs, args)
+	if limit > 0 {
+		dataQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+		dataArgs = append(dataArgs, limit, offset)
+	}
+
+	rows, err := s.database.Query(dataQuery, dataArgs...)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "Failed to query DCPs", err.Error())
 		return
@@ -824,12 +1107,12 @@ func (s *Server) handleListDCPs(w http.ResponseWriter, r *http.Request) {
 	var dcps []map[string]interface{}
 	for rows.Next() {
 		var id, assetMapUUID uuid.UUID
-		var packageName, contentTitle, contentKind, issuer string
+		var packageName, contentTitle, contentKind2, issuer string
 		var totalSize int64
 		var fileCount int
 		var discoveredAt time.Time
 
-		if err := rows.Scan(&id, &assetMapUUID, &packageName, &contentTitle, &contentKind,
+		if err := rows.Scan(&id, &assetMapUUID, &packageName, &contentTitle, &contentKind2,
 			&issuer, &totalSize, &fileCount, &discoveredAt); err != nil {
 			log.Printf("Error scanning DCP row: %v", err)
 			continue
@@ -840,17 +1123,23 @@ func (s *Server) handleListDCPs(w http.ResponseWriter, r *http.Request) {
 			"assetmap_uuid":    assetMapUUID,
 			"package_name":     packageName,
 			"content_title":    contentTitle,
-			"content_kind":     contentKind,
+			"content_kind":     contentKind2,
 			"issuer":           issuer,
 			"total_size_bytes": totalSize,
 			"file_count":       fileCount,
 			"discovered_at":    discoveredAt,
 		})
 	}
+	if dcps == nil {
+		dcps = []map[string]interface{}{}
+	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"dcps":  dcps,
-		"count": len(dcps),
+		"dcps":        dcps,
+		"count":       len(dcps),
+		"total_count": totalCount,
+		"offset":      offset,
+		"limit":       limit,
 	})
 }
 
@@ -1065,22 +1354,17 @@ func (s *Server) handleTriggerUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set target version and upgrade status
-	_, err = s.database.DB.Exec(`
-		UPDATE servers 
-		SET target_version = $1, upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
-		WHERE id = $2`,
-		request.TargetVersion, serverID)
-
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "Failed to set upgrade target", err.Error())
-		return
-	}
-
 	log.Printf("Upgrade triggered for server %s to version %s", serverID, request.TargetVersion)
 
 	// If this process is the target (main server upgrading itself), run upgrade locally then restart
 	if s.selfServerID != nil && *s.selfServerID == serverID {
+		// Set status in database first
+		s.database.DB.Exec(`
+			UPDATE servers
+			SET target_version = $1, upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = $2`,
+			request.TargetVersion, serverID)
+
 		go func() {
 			baseURL := "http://127.0.0.1:" + strconv.Itoa(s.port)
 			if err := updater.PerformSelfUpgrade(baseURL, request.TargetVersion); err != nil {
@@ -1093,13 +1377,56 @@ func (s *Server) handleTriggerUpgrade(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(2 * time.Second)
 			syscall.Kill(os.Getpid(), syscall.SIGTERM)
 		}()
+
+		s.logActivity(r, "server.upgrade", "servers", "server", vars["id"], "", "", "success")
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"message":        "Upgrade triggered successfully (local)",
+			"server_id":      serverID,
+			"target_version": request.TargetVersion,
+			"status":         "pending",
+		})
+		return
 	}
 
+	// Try WebSocket first (instant delivery if client is connected)
+	if s.wsHub != nil && s.wsHub.IsClientConnected(serverID) {
+		payload := map[string]interface{}{
+			"version": request.TargetVersion,
+		}
+		if err := s.wsHub.SendCommandToClient(serverID, ws.CommandUpgrade, payload); err == nil {
+			log.Printf("Upgrade command sent via WebSocket to server %s", serverID)
+			s.logActivity(r, "server.upgrade", "servers", "server", vars["id"], "", "", "success")
+			respondJSON(w, http.StatusOK, map[string]interface{}{
+				"message":        "Upgrade command sent successfully (via WebSocket)",
+				"server_id":      serverID,
+				"target_version": request.TargetVersion,
+				"status":         "sent",
+				"method":         "websocket",
+			})
+			return
+		}
+		log.Printf("WebSocket send failed for %s, falling back to database flag", serverID)
+	}
+
+	// Fallback to database flag for HTTP polling (legacy method)
+	_, err = s.database.DB.Exec(`
+		UPDATE servers
+		SET target_version = $1, upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
+		WHERE id = $2`,
+		request.TargetVersion, serverID)
+
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to set upgrade target", err.Error())
+		return
+	}
+
+	s.logActivity(r, "server.upgrade", "servers", "server", vars["id"], "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"message":        "Upgrade triggered successfully",
+		"message":        "Upgrade triggered successfully (polling mode)",
 		"server_id":      serverID,
 		"target_version": request.TargetVersion,
 		"status":         "pending",
+		"method":         "polling",
 	})
 }
 
@@ -1112,10 +1439,45 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If this process is the target (main server restarting itself), restart locally after a short delay
+	if s.selfServerID != nil && *s.selfServerID == serverID {
+		log.Printf("Restart target is this server; scheduling local restart in 2s")
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("Sending SIGTERM for self-restart (systemd will restart the service)")
+			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		}()
+
+		s.logActivity(r, "server.restart", "servers", "server", vars["id"], "", "", "success")
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"message":   "Restart triggered successfully (local)",
+			"server_id": serverID,
+			"status":    "pending",
+		})
+		return
+	}
+
+	// Try WebSocket first (instant delivery if client is connected)
+	if s.wsHub != nil && s.wsHub.IsClientConnected(serverID) {
+		if err := s.wsHub.SendCommandToClient(serverID, ws.CommandRestart, nil); err == nil {
+			log.Printf("Restart command sent via WebSocket to server %s", serverID)
+			s.logActivity(r, "server.restart", "servers", "server", vars["id"], "", "", "success")
+			respondJSON(w, http.StatusOK, map[string]interface{}{
+				"message":   "Restart command sent successfully (via WebSocket)",
+				"server_id": serverID,
+				"status":    "sent",
+				"method":    "websocket",
+			})
+			return
+		}
+		log.Printf("WebSocket send failed for %s, falling back to database flag", serverID)
+	}
+
+	// Fallback to database flag for HTTP polling (legacy method)
 	// Set a restart flag by setting target_version to "restart"
 	// The update agent (on remote clients) will detect this and restart their service
 	_, err = s.database.DB.Exec(`
-		UPDATE servers 
+		UPDATE servers
 		SET target_version = 'restart', upgrade_status = 'pending', updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1`,
 		serverID)
@@ -1125,22 +1487,14 @@ func (s *Server) handleRestartServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Restart triggered for server %s", serverID)
+	log.Printf("Restart flag set in database for server %s (will be polled)", serverID)
 
-	// If this process is the target (main server restarting itself), restart locally after a short delay
-	if s.selfServerID != nil && *s.selfServerID == serverID {
-		log.Printf("Restart target is this server; scheduling local restart in 2s")
-		go func() {
-			time.Sleep(2 * time.Second)
-			log.Printf("Sending SIGTERM for self-restart (systemd will restart the service)")
-			syscall.Kill(os.Getpid(), syscall.SIGTERM)
-		}()
-	}
-
+	s.logActivity(r, "server.restart", "servers", "server", vars["id"], "", "", "success")
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"message":   "Restart triggered successfully",
+		"message":   "Restart triggered successfully (polling mode)",
 		"server_id": serverID,
 		"status":    "pending",
+		"method":    "polling",
 	})
 }
 
@@ -1189,7 +1543,9 @@ func (s *Server) handlePendingAction(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]interface{}{"action": nil})
 }
 
-// handlePendingTransfers returns transfers queued for a specific server
+// handlePendingTransfers returns transfers that need to be downloaded by a specific server.
+// Returns both 'queued' transfers AND 'downloading' transfers with 0 progress (stuck from
+// a previous failed attempt) so the client can re-initiate them.
 func (s *Server) handlePendingTransfers(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	serverID, err := uuid.Parse(vars["id"])
@@ -1198,26 +1554,37 @@ func (s *Server) handlePendingTransfers(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Query transfers where destination_server_id matches and status is 'queued'
+	log.Printf("[pending-transfers] Request from server %s", serverID)
+
+	// Return transfers that are:
+	// 1. 'queued' - waiting to be started
+	// 2. 'downloading' - in progress (may need resuming after client restart)
+	// 3. 'active' - alternative status for in-progress transfers
+	// The client's TransferProcessor will skip transfers it's already handling.
+	// PostgreSQL piece completion ensures already-downloaded pieces aren't re-downloaded.
 	rows, err := s.database.Query(`
-		SELECT 
-			t.id, 
-			t.torrent_id, 
+		SELECT
+			t.id,
+			t.torrent_id,
 			t.source_server_id,
 			t.destination_server_id,
 			t.priority,
-			COALESCE(dp.id, '') as package_id,
+			t.status,
+			t.progress_percent,
+			COALESCE(dp.id::text, '') as package_id,
 			COALESCE(dp.package_name, '') as package_name,
 			COALESCE(dp.total_size_bytes, 0) as total_size_bytes,
-			dt.info_hash
+			COALESCE(dt.info_hash, '') as info_hash
 		FROM transfers t
 		LEFT JOIN dcp_torrents dt ON t.torrent_id = dt.id
 		LEFT JOIN dcp_packages dp ON dt.package_id = dp.id
-		WHERE t.destination_server_id = $1 AND t.status = 'queued'
+		WHERE t.destination_server_id = $1
+		  AND t.status IN ('queued', 'downloading', 'checking', 'active')
 		ORDER BY t.priority DESC, t.created_at ASC
 		LIMIT 10
 	`, serverID)
 	if err != nil {
+		log.Printf("[pending-transfers] Database error for server %s: %v", serverID, err)
 		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
 		return
 	}
@@ -1225,34 +1592,222 @@ func (s *Server) handlePendingTransfers(w http.ResponseWriter, r *http.Request) 
 
 	transfers := []map[string]interface{}{}
 	for rows.Next() {
-		var id, torrentID, sourceServerID, destServerID uuid.UUID
+		var id, torrentID, destServerID uuid.UUID
+		var sourceServerID sql.NullString
 		var priority int
+		var status string
+		var progressPercent float64
 		var packageID, packageName string
 		var totalSizeBytes int64
 		var infoHash string
 
 		if err := rows.Scan(&id, &torrentID, &sourceServerID, &destServerID, &priority,
+			&status, &progressPercent,
 			&packageID, &packageName, &totalSizeBytes, &infoHash); err != nil {
-			log.Printf("Error scanning transfer row: %v", err)
+			log.Printf("[pending-transfers] Error scanning transfer row: %v", err)
 			continue
 		}
+
+		log.Printf("[pending-transfers]   Found: id=%s package=%q status=%s progress=%.1f%% info_hash=%s",
+			id, packageName, status, progressPercent, infoHash)
 
 		transfer := map[string]interface{}{
 			"id":                    id,
 			"torrent_id":            torrentID,
 			"package_id":            packageID,
 			"package_name":          packageName,
-			"source_server_id":      sourceServerID,
 			"destination_server_id": destServerID,
 			"priority":              priority,
 			"total_size_bytes":      totalSizeBytes,
-			"torrent_file_url":      fmt.Sprintf("/api/v1/torrents/%s/file", torrentID),
+			"torrent_file_url":      fmt.Sprintf("/api/v1/torrents/%s/file", infoHash),
+		}
+		if sourceServerID.Valid {
+			transfer["source_server_id"] = sourceServerID.String
 		}
 
 		transfers = append(transfers, transfer)
 	}
 
+	log.Printf("[pending-transfers] Returning %d transfer(s) for server %s", len(transfers), serverID)
 	respondJSON(w, http.StatusOK, transfers)
+}
+
+// handleTransferCommands returns pending commands (pause, resume, cancel) for a server's transfers.
+// The client polls this to discover commands it needs to execute.
+func (s *Server) handleTransferCommands(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	rows, err := s.database.Query(`
+		SELECT t.id, COALESCE(dt.info_hash, '') as info_hash,
+		       COALESCE(dp.package_name, '') as package_name,
+		       COALESCE(t.pending_command, '') as command,
+		       COALESCE(t.delete_data, false) as delete_data,
+		       t.status
+		FROM transfers t
+		LEFT JOIN dcp_torrents dt ON t.torrent_id = dt.id
+		LEFT JOIN dcp_packages dp ON dt.package_id = dp.id
+		WHERE t.destination_server_id = $1
+		  AND COALESCE(t.pending_command, '') != ''
+		  AND COALESCE(t.command_acknowledged, true) = false
+	`, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var items []map[string]interface{}
+	for rows.Next() {
+		var id, infoHash, packageName, command, status string
+		var deleteData bool
+		if err := rows.Scan(&id, &infoHash, &packageName, &command, &deleteData, &status); err != nil {
+			continue
+		}
+		items = append(items, map[string]interface{}{
+			"id":           id,
+			"info_hash":    infoHash,
+			"package_name": packageName,
+			"command":      command,
+			"delete_data":  deleteData,
+			"status":       status,
+		})
+	}
+	if items == nil {
+		items = []map[string]interface{}{}
+	}
+	respondJSON(w, http.StatusOK, items)
+}
+
+// handleTransferCommandAck marks a command as acknowledged by the client
+func (s *Server) handleTransferCommandAck(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var req struct {
+		TransferID string `json:"transfer_id"`
+		Result     string `json:"result"` // "done", "deleted", "kept", "error"
+		Message    string `json:"message,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	_, err = s.database.Exec(`
+		UPDATE transfers SET command_acknowledged = true, pending_command = '', updated_at = $1
+		WHERE id = $2 AND destination_server_id = $3
+	`, time.Now(), req.TransferID, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+
+	log.Printf("[command-ack] Server %s acknowledged command for transfer %s: %s (%s)",
+		serverID, req.TransferID, req.Result, req.Message)
+	respondJSON(w, http.StatusOK, map[string]string{"message": "acknowledged"})
+}
+
+// handleContentCommands returns pending content commands for a server (client polls this)
+func (s *Server) handleContentCommands(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, package_id, package_name, info_hash, command, COALESCE(target_path, '')
+		FROM content_commands
+		WHERE server_id = $1 AND status = 'pending'
+		ORDER BY created_at ASC
+	`, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var items []map[string]interface{}
+	for rows.Next() {
+		var id, packageID, packageName, infoHash, command, targetPath string
+		if err := rows.Scan(&id, &packageID, &packageName, &infoHash, &command, &targetPath); err != nil {
+			continue
+		}
+		items = append(items, map[string]interface{}{
+			"id":           id,
+			"package_id":   packageID,
+			"package_name": packageName,
+			"info_hash":    infoHash,
+			"command":      command,
+			"target_path":  targetPath,
+		})
+	}
+	if items == nil {
+		items = []map[string]interface{}{}
+	}
+	respondJSON(w, http.StatusOK, items)
+}
+
+// handleContentCommandAck acknowledges a content command from the client
+func (s *Server) handleContentCommandAck(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	serverID, err := uuid.Parse(vars["id"])
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid server ID", err.Error())
+		return
+	}
+
+	var req struct {
+		CommandID string `json:"command_id"`
+		Result    string `json:"result"`  // "deleted", "error"
+		Message   string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	now := time.Now()
+	status := "completed"
+	if req.Result == "error" {
+		status = "error"
+	}
+
+	_, err = s.db.Exec(`
+		UPDATE content_commands SET status = $1, result_message = $2, acknowledged_at = $3
+		WHERE id = $4 AND server_id = $5
+	`, status, req.Message, now, req.CommandID, serverID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Database error", err.Error())
+		return
+	}
+
+	// If successfully deleted, remove from server_dcp_inventory
+	if req.Result == "deleted" {
+		var packageID string
+		err := s.db.QueryRow("SELECT package_id FROM content_commands WHERE id = $1", req.CommandID).Scan(&packageID)
+		if err == nil {
+			_, err = s.db.Exec("DELETE FROM server_dcp_inventory WHERE server_id = $1 AND package_id = $2", serverID, packageID)
+			if err != nil {
+				log.Printf("[content-cmd-ack] Warning: failed to remove inventory for server=%s package=%s: %v", serverID, packageID, err)
+			} else {
+				log.Printf("[content-cmd-ack] Removed inventory entry for server=%s package=%s", serverID, packageID)
+			}
+		}
+	}
+
+	log.Printf("[content-cmd-ack] Server %s acknowledged content command %s: %s (%s)", serverID, req.CommandID, req.Result, req.Message)
+	respondJSON(w, http.StatusOK, map[string]string{"message": "acknowledged"})
 }
 
 // handleActionDone clears the pending action after the agent has completed restart or upgrade
@@ -1355,6 +1910,7 @@ func (s *Server) handleRescanServer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		go s.triggerScan()
+		s.logActivity(r, "server.rescan", "servers", "server", vars["id"], "", "", "success")
 		respondJSON(w, http.StatusAccepted, map[string]string{"message": "Rescan started"})
 		return
 	}
@@ -1387,6 +1943,7 @@ func (s *Server) handleRescanServer(w http.ResponseWriter, r *http.Request) {
 		respondError(w, resp.StatusCode, "Server returned error", string(body))
 		return
 	}
+	s.logActivity(r, "server.rescan", "servers", "server", vars["id"], "", "", "success")
 	respondJSON(w, http.StatusAccepted, map[string]string{"message": "Rescan started on remote server"})
 }
 
@@ -1461,4 +2018,199 @@ func hashRegistrationKey(key string) string {
 // verifyRegistrationKey checks if a key matches the stored hash
 func verifyRegistrationKey(key, hash string) bool {
 	return hashRegistrationKey(key) == hash
+}
+
+// handleCreateBuild triggers a new build AND deployment via deployTests.sh
+func (s *Server) handleCreateBuild(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		VersionName string `json:"version_name"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	log.Printf("Build & Deploy triggered via API (version: %s)", body.VersionName)
+
+	// Use deployTests.sh which builds, deploys, and restarts services
+	scriptPath := "/home/appbox/DCPCLOUDAPP/omnicloud/deployTests.sh"
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		respondError(w, http.StatusInternalServerError, "Deploy script not found", scriptPath)
+		return
+	}
+
+	go func() {
+		cmd := exec.Command("/bin/bash", scriptPath)
+		cmd.Dir = "/home/appbox/DCPCLOUDAPP/omnicloud"
+		if body.VersionName != "" {
+			cmd.Env = append(os.Environ(), fmt.Sprintf("VERSION=%s", body.VersionName))
+		}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("Build & Deploy failed: %v\nOutput: %s", err, string(output))
+		} else {
+			log.Printf("Build & Deploy completed:\n%s", string(output))
+		}
+
+		// After successful deployment, also create release tarball for distribution
+		releasePath := "/home/appbox/DCPCLOUDAPP/omnicloud/scripts/build-release.sh"
+		if _, err := os.Stat(releasePath); err == nil {
+			releaseCmd := exec.Command("/bin/bash", releasePath)
+			releaseCmd.Dir = "/home/appbox/DCPCLOUDAPP/omnicloud"
+			if body.VersionName != "" {
+				releaseCmd.Env = append(os.Environ(), fmt.Sprintf("VERSION=%s", body.VersionName))
+			}
+			releaseOutput, releaseErr := releaseCmd.CombinedOutput()
+			if releaseErr != nil {
+				log.Printf("Release package creation failed: %v\nOutput: %s", releaseErr, string(releaseOutput))
+			} else {
+				log.Printf("Release package created:\n%s", string(releaseOutput))
+			}
+		}
+	}()
+
+	respondJSON(w, http.StatusAccepted, map[string]interface{}{
+		"message": "Build, deployment, and release package creation started in background",
+	})
+}
+
+// handleLogIngest receives logs from client servers
+func (s *Server) handleLogIngest(w http.ResponseWriter, r *http.Request) {
+	var logs struct {
+		ServerID string   `json:"server_id"`
+		Lines    []string `json:"lines"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&logs); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid request body", "")
+		return
+	}
+	
+	for _, line := range logs.Lines {
+		log.Printf("[%s] %s", logs.ServerID, line)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleInstallScript serves the quick-install script for one-command client installation.
+// Tries multiple paths so it works from dev (DCPCLOUDAPP) and production (/opt/omnicloud).
+func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+	// Try paths in order: working dir, executable-relative, then dev path
+	var scriptPath string
+	candidates := []string{}
+
+	if workDir, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(workDir, "scripts", "quick-install.sh"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(exeDir, "scripts", "quick-install.sh"))
+		// If binary is in bin/, script is often in sibling scripts/
+		candidates = append(candidates, filepath.Join(filepath.Dir(exeDir), "scripts", "quick-install.sh"))
+	}
+	candidates = append(candidates, "/home/appbox/DCPCLOUDAPP/omnicloud/scripts/quick-install.sh")
+
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			scriptPath = p
+			break
+		}
+	}
+	if scriptPath == "" {
+		log.Printf("Install script not found; tried: %v", candidates)
+		http.Error(w, "Install script not found", http.StatusNotFound)
+		return
+	}
+
+	content, err := ioutil.ReadFile(scriptPath)
+	if err != nil {
+		log.Printf("Error reading install script at %s: %v", scriptPath, err)
+		http.Error(w, "Install script not found", http.StatusNotFound)
+		return
+	}
+
+	// Serve as plain text shell script
+	w.Header().Set("Content-Type", "text/x-shellscript")
+	w.Header().Set("Content-Disposition", "inline; filename=\"install-omnicloud.sh\"")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	w.Write(content)
+
+	log.Printf("Install script served to %s", r.RemoteAddr)
+}
+
+// handleAdminDBReset clears all content, hashing progress, and torrents from the DB (keeps servers).
+func (s *Server) handleAdminDBReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+		return
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("Admin DB reset: begin tx: %v", err)
+		respondError(w, http.StatusInternalServerError, "Database error", "")
+		return
+	}
+	defer tx.Rollback()
+
+	// Optional tables (may not exist on all migrations) — use DO block so missing tables don't abort tx
+	_, err = tx.Exec(`
+		DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'torrent_announce_attempts') THEN
+				TRUNCATE TABLE torrent_announce_attempts RESTART IDENTITY CASCADE;
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'torrent_generation_claim') THEN
+				TRUNCATE TABLE torrent_generation_claim CASCADE;
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'server_torrent_status') THEN
+				TRUNCATE TABLE server_torrent_status CASCADE;
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'server_torrent_stats') THEN
+				TRUNCATE TABLE server_torrent_stats CASCADE;
+			END IF;
+			IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'torrent_piece_completion') THEN
+				TRUNCATE TABLE torrent_piece_completion CASCADE;
+			END IF;
+		END $$;
+	`)
+	if err != nil {
+		log.Printf("Admin DB reset: optional tables: %v", err)
+		respondError(w, http.StatusInternalServerError, "Database error during reset", "")
+		return
+	}
+
+	// Required tables in dependency order
+	truncates := []struct {
+		table string
+		id    bool
+	}{
+		{"torrent_seeders", false}, {"transfers", false}, {"torrent_queue", false}, {"dcp_torrents", false},
+		{"server_dcp_inventory", false}, {"scan_logs", true},
+		{"dcp_reels", false}, {"dcp_compositions", false}, {"dcp_assets", false}, {"dcp_packing_lists", false}, {"dcp_packages", false},
+	}
+	for _, t := range truncates {
+		stmt := "TRUNCATE TABLE " + t.table + " CASCADE"
+		if t.id {
+			stmt = "TRUNCATE TABLE " + t.table + " RESTART IDENTITY CASCADE"
+		}
+		if _, err := tx.Exec(stmt); err != nil {
+			log.Printf("Admin DB reset: truncate %s: %v", t.table, err)
+			respondError(w, http.StatusInternalServerError, "Database error during reset", "")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("Admin DB reset: commit: %v", err)
+		respondError(w, http.StatusInternalServerError, "Database error", "")
+		return
+	}
+
+	log.Printf("Admin DB reset completed (content, hashing, torrents cleared; servers kept)")
+	s.logActivity(r, "system.db_reset", "system", "", "", "", "", "success")
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "Database reset complete. All content, hashing progress, and torrents cleared. Servers kept.",
+	})
 }

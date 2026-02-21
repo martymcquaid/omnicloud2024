@@ -31,7 +31,7 @@ func (cpl *CompositionPlaylist) GetTotalDuration() int {
 	total := 0
 	for _, reel := range cpl.ReelList.Reels {
 		if reel.AssetList.MainPicture != nil {
-			total += reel.AssetList.MainPicture.Duration
+			total += int(reel.AssetList.MainPicture.Duration)
 		}
 	}
 	return total
